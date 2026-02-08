@@ -18,22 +18,37 @@ export async function GET(req: NextRequest) {
 
   try {
     // 1. Fetch the YouTube watch page
-    const watchRes = await fetch(
-      `https://www.youtube.com/watch?v=${videoId}`,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      }
-    );
+    const watchUrl =
+      `https://www.youtube.com/watch?v=${videoId}` +
+      `&hl=en&gl=US&persist_hl=1&persist_gl=1&bpctr=9999999999&has_verified=1`;
+    
+    const watchRes = await fetch(watchUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    
+        // 🔥 핵심: consent 우회 쿠키
+        cookie: "CONSENT=YES+1; SOCS=CAI;",
+    
+        // YouTube가 브라우저처럼 보이게
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+      },
+    });
+
 
     if (!watchRes.ok) {
       return NextResponse.json({ transcript: null });
     }
 
     const html = await watchRes.text();
+    // If we still got a consent page, abort
+    if (html.includes("consent.youtube.com") || html.includes("action=\"https://consent.youtube.com")) {
+      return NextResponse.json({ transcript: null, reason: "CONSENT_PAGE" });
+    }
+
 
     // 2. Extract ytInitialPlayerResponse JSON
     const prMatch = html.match(
