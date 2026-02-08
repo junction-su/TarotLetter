@@ -1,15 +1,16 @@
 @import "tailwindcss";
 
 @theme {
-  --color-midnight: #0f0a1a;
-  --color-dusk: #1a1028;
-  --color-twilight: #251a36;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --color-midnight: #0c0a12;
+  --color-dusk: #15121e;
+  --color-twilight: #1f1a2e;
   --color-violet: #6d28d9;
   --color-violet-light: #8b5cf6;
   --color-violet-glow: #a78bfa;
   --color-lavender: #c4b5fd;
-  --color-mist: #e2d9f3;
-  --color-cream: #f5f0ff;
+  --color-mist: #ddd6f3;
+  --color-cream: #f0ecf9;
   --color-gold: #f59e0b;
   --color-rose: #f472b6;
   --color-sage: #34d399;
@@ -19,10 +20,9 @@
 body {
   background-color: var(--color-midnight);
   color: var(--color-cream);
-  font-family: "Georgia", "Times New Roman", serif;
+  font-family: var(--font-sans);
 }
 
-/* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;
 }
@@ -32,4 +32,9 @@ body {
 ::-webkit-scrollbar-thumb {
   background: var(--color-twilight);
   border-radius: 3px;
+}
+
+/* Date input color scheme for dark theme */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
 }

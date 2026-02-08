@@ -12,16 +12,31 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+          rel="stylesheet"
+        />
+      </head>
       <body className="min-h-screen antialiased">
-        <header className="border-b border-twilight/50">
+        <header className="border-b border-twilight/40">
           <nav className="mx-auto flex max-w-2xl items-center justify-between px-4 py-4">
-            <a href="/" className="text-xl tracking-wide text-lavender">
+            <a
+              href="/"
+              className="text-lg font-semibold tracking-tight text-lavender"
+            >
               TarotLetter
             </a>
             <a
               href="/new"
-              className="rounded-lg bg-violet px-4 py-2 text-sm text-cream transition-colors hover:bg-violet-light"
+              className="rounded-lg bg-violet px-4 py-2 text-sm font-medium text-cream transition-colors hover:bg-violet-light"
             >
               + New Reading
             </a>
