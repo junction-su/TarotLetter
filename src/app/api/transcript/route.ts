@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+export const runtime = "nodejs";
 
 // ── Types ──
 
@@ -51,7 +52,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   "Sec-Ch-Ua-Platform": '"Windows"',
   Referer: "https://www.youtube.com/",
   // SOCS cookie = pre-accepted GDPR consent (value from a real accept-all)
-  Cookie: "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNTI4LjA3X3AxGgJlbiACGgYIgMCxsgY; CONSENT=PENDING+987",
+  Cookie: "CONSENT=YES+1; SOCS=CAI;",
 };
 
 /**
@@ -202,8 +203,12 @@ async function fetchWatchPage(videoId: string): Promise<WatchPageResult> {
   for (const hl of ["ko", "en"]) {
     const res = await fetch(
       `https://www.youtube.com/watch?v=${videoId}&hl=${hl}&persist_hl=1&bpctr=9999999999`,
-      { headers: BROWSER_HEADERS },
+      {
+        headers: BROWSER_HEADERS,
+        cache: "no-store",
+      },
     );
+
 
     if (!res.ok) continue;
 
