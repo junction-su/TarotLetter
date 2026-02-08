@@ -6,6 +6,7 @@ import { TarotEntry } from "@/types/entry";
 import { saveEntry, generateId } from "@/lib/storage";
 import {
   fetchVideoMeta,
+  fetchTranscript,
   parseTimecodes,
   containsKorean,
   type VideoMeta,
@@ -56,6 +57,10 @@ export default function NewEntryPage() {
 
   // Transcript / notes
   const [transcript, setTranscript] = useState("");
+  const [transcriptStatus, setTranscriptStatus] = useState<
+    "idle" | "loading" | "auto" | "manual"
+  >("idle");
+  const [showCopyHelp, setShowCopyHelp] = useState(false);
 
   // Summary
   const [summaryLang, setSummaryLang] = useState<SummaryLanguage>("auto");
@@ -72,15 +77,24 @@ export default function NewEntryPage() {
     if (!youtubeUrl.trim()) return;
     setFetching(true);
     setFetchError(false);
+    setTranscriptStatus("idle");
 
     const meta = await fetchVideoMeta(youtubeUrl);
     if (meta) {
       setVideoMeta(meta);
-      // Parse timecodes from title (best we can do without API key)
       const tc = parseTimecodes(meta.title);
       setTimecodeOptions(tc);
-      // Detect Korean
       setIsKorean(containsKorean(meta.title));
+
+      // Attempt transcript auto-fetch in background
+      setTranscriptStatus("loading");
+      const text = await fetchTranscript(youtubeUrl);
+      if (text) {
+        setTranscript(text);
+        setTranscriptStatus("auto");
+      } else {
+        setTranscriptStatus("manual");
+      }
     } else {
       setFetchError(true);
     }
@@ -136,7 +150,7 @@ export default function NewEntryPage() {
     router.push("/");
   }
 
-  const canGenerate = fetched && effectiveCard;
+  const canGenerate = fetched && effectiveCard && transcript.trim().length > 0;
   const canSave = fetched && effectiveCard && revisitDate;
 
   return (
@@ -319,17 +333,83 @@ export default function NewEntryPage() {
           <label className="block text-sm text-mist/60">
             What did the reader say?
           </label>
-          <p className="text-xs text-mist/40">
-            Paste the transcript or type your notes from the reading. Only what
-            you write here will appear in the summary — nothing is invented.
-          </p>
-          <textarea
-            value={transcript}
-            onChange={(e) => setTranscript(e.target.value)}
-            rows={6}
-            placeholder="e.g., The reader said there's a job offer coming in March, possibly from someone you already know. They warned about signing contracts too quickly…"
-            className="w-full rounded-lg border border-twilight bg-dusk px-4 py-3 text-sm leading-relaxed text-cream placeholder-mist/30 outline-none transition-colors focus:border-violet/60"
-          />
+
+          {/* Status indicator */}
+          {transcriptStatus === "loading" && (
+            <p className="text-xs text-lavender/60">
+              Fetching transcript from YouTube…
+            </p>
+          )}
+          {transcriptStatus === "auto" && (
+            <p className="text-xs text-sage">
+              Transcript imported automatically. Review and edit if needed.
+            </p>
+          )}
+          {transcriptStatus === "manual" && (
+            <div className="space-y-1">
+              <p className="text-xs text-gold/80">
+                Transcript not available for this video. Paste it manually
+                below.
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowCopyHelp((v) => !v)}
+                className="text-xs text-violet-light underline hover:text-violet-glow"
+              >
+                {showCopyHelp
+                  ? "Hide instructions"
+                  : "How do I copy a YouTube transcript?"}
+              </button>
+              {showCopyHelp && (
+                <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-mist/50">
+                  <li>
+                    Open the video on YouTube in a desktop browser.
+                  </li>
+                  <li>
+                    Click the <strong className="text-mist/70">…</strong> (more)
+                    button below the video.
+                  </li>
+                  <li>
+                    Select{" "}
+                    <strong className="text-mist/70">Show transcript</strong>.
+                  </li>
+                  <li>
+                    A transcript panel opens on the right. Click inside it, press{" "}
+                    <kbd className="rounded border border-twilight px-1 text-mist/70">
+                      Ctrl+A
+                    </kbd>{" "}
+                    (or{" "}
+                    <kbd className="rounded border border-twilight px-1 text-mist/70">
+                      Cmd+A
+                    </kbd>
+                    ) to select all, then{" "}
+                    <kbd className="rounded border border-twilight px-1 text-mist/70">
+                      Ctrl+C
+                    </kbd>{" "}
+                    to copy.
+                  </li>
+                  <li>Paste it into the field below.</li>
+                </ol>
+              )}
+            </div>
+          )}
+
+          {/* Always show the textarea once status is resolved */}
+          {transcriptStatus !== "idle" && transcriptStatus !== "loading" && (
+            <>
+              <textarea
+                value={transcript}
+                onChange={(e) => setTranscript(e.target.value)}
+                rows={8}
+                placeholder="Paste the transcript or type your notes from the reading…"
+                className="w-full rounded-lg border border-twilight bg-dusk px-4 py-3 text-sm leading-relaxed text-cream placeholder-mist/30 outline-none transition-colors focus:border-violet/60"
+              />
+              <p className="text-xs text-mist/40">
+                Only what appears here will be used in the summary — nothing is
+                invented.
+              </p>
+            </>
+          )}
         </section>
       )}
 

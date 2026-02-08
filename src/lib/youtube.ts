@@ -108,6 +108,26 @@ export function parseTimecodes(text: string): TimecodeOption[] {
 }
 
 /**
+ * Attempt to fetch transcript text via the server-side API route.
+ * Returns the transcript string, or null if captions are unavailable.
+ */
+export async function fetchTranscript(url: string): Promise<string | null> {
+  const videoId = extractVideoId(url);
+  if (!videoId) return null;
+
+  try {
+    const res = await fetch(
+      `/api/transcript?v=${encodeURIComponent(videoId)}`
+    );
+    if (!res.ok) return null;
+    const data: { transcript: string | null } = await res.json();
+    return data.transcript ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Detect if text contains Korean characters.
  */
 export function containsKorean(text: string): boolean {
