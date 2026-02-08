@@ -102,6 +102,11 @@ export async function GET(req: NextRequest) {
         redirect: "follow",
         cache: "no-store",
       });
+      console.log("[caption] status", captionRes.status);
+      console.log("[caption] url", track.baseUrl.slice(0, 180));
+      const xml = await captionRes.text();
+      console.log("[caption] bytes", xml.length);
+
 
       if (captionRes.ok) {
         const xml = await captionRes.text();
@@ -302,6 +307,9 @@ async function tryTimedtextApi(videoId: string): Promise<string | null> {
     });
 
     if (!res.ok) continue;
+    const xml = await res.text();
+    console.log("[timedtext]", lang, "status", res.status, "bytes", xml.length);
+
 
     const xml = await res.text();
     const segments = parseCaptionXml(xml);
