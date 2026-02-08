@@ -40,28 +40,25 @@ You only extract and reorganize what the reader actually said.
 Your goal is to preserve as much specific content as possible while organizing it into clear sections.
 
 The following text is from a tarot reading video.
-The user selected: ${req.selectedCard}
 
 CRITICAL RULES:
+- Every bullet point must be directly grounded in the input text. If you cannot point to where it was said, do not include it.
 - ONLY include statements that explicitly appear in the input text.
 - Do NOT shorten into vague themes.
 - Do NOT use generic phrases like "trust your intuition", "transformation",
   "inner clarity", "balance", "new beginnings", or "alignment" unless the
   reader literally said those exact words.
 - Keep concrete statements, situations, events, warnings, and predictions.
-- Do NOT repeat the video title or card number.
+- Do NOT repeat the video title, channel name, or selected card label in the output.
 - Do NOT create new interpretations or generalizations.
 - If a statement was not said in the reading, do NOT include it.
 
 Instructions:
-1. Identify the main topics the reader talks about (for example: work, love, money, timing, personality, emotional state, specific situations, etc.).
-2. Create section headings based on those actual topics.
+1. Read the entire text and identify the actual topics the reader discusses.
+2. Create section headings dynamically based on those topics — do not use a fixed template.
 3. Under each section, list bullet points capturing what the reader said — using their words, not paraphrasing into generic language.
-4. If the reading mentions timeframes (days, weeks, months, seasons, "soon", "after a delay"), create a section called "Timing".
-5. If there are warnings or cautions, create a section called "Things to Be Careful About".
-6. If there are strong positive opportunities, create a section called "Opportunities".
-7. Do not force sections that do not exist in the reading.
-8. If the text is too short or vague to extract concrete statements, say so honestly rather than filling in generic content.
+4. Only create a section if the reading contains concrete statements for it.
+5. If the text is too short or vague to extract concrete statements, say so honestly rather than filling in generic content.
 
 Write in a natural note-taking style, not like an essay.${langInstruction}
 
@@ -90,47 +87,87 @@ export async function generateReadingSummary(
 
   const useKorean =
     req.language === "ko" ||
-    (req.language === "auto" && req.isKoreanContent);
+    (req.language === "auto" && req.isKoreanContent === true);
 
-  // If no transcript/notes provided, return a clear placeholder — never
+  // If no transcript/notes provided, return a short instruction — never
   // fabricate content that wasn't in the reading.
   if (!req.transcript?.trim()) {
-    if (useKorean) {
-      return (
-        `선택: ${req.selectedCard}\n\n` +
-        `(정리할 내용이 없습니다. 위의 메모 입력란에 리딩 내용을 붙여넣으면 구조화된 요약이 생성됩니다.)`
-      );
-    }
-    return (
-      `Selection: ${req.selectedCard}\n\n` +
-      `(No notes to organize. Paste what the reader said in the notes field above, then generate again to get a structured summary.)`
-    );
+    return useKorean
+      ? "(리딩 내용을 위의 메모란에 붙여넣은 후 다시 생성해 주세요.)"
+      : "(Paste what the reader said in the notes field above, then generate again.)";
   }
 
   // With a real AI provider this would call the API with buildPrompt(req).
-  // For the MVP mock, echo back the user's own notes organized minimally —
-  // never adding content that wasn't provided.
-  if (useKorean) {
-    return (
-      `선택: ${req.selectedCard}\n\n` +
-      `## 리딩 노트\n` +
-      req.transcript
-        .trim()
-        .split("\n")
-        .filter((line) => line.trim())
-        .map((line) => `- ${line.trim()}`)
-        .join("\n")
+  // For the MVP mock, do a simple structural extraction: group lines into
+  // topic-based sections using keyword detection, preserving only what the
+  // user actually typed — never adding content.
+  return structureTranscript(req.transcript, useKorean);
+}
+
+// ── Simple keyword-based grouping for MVP (no LLM) ──
+
+const TOPIC_PATTERNS: { key: string; en: string; ko: string; re: RegExp }[] = [
+  { key: "work", en: "Work / Career", ko: "직장 / 커리어", re: /\b(job|work|career|boss|company|promotion|office|business|interview|hire|fired|resign|colleague)\b/i },
+  { key: "love", en: "Love / Relationships", ko: "연애 / 관계", re: /\b(love|relationship|partner|ex|dating|marriage|boyfriend|girlfriend|crush|breakup|romantic|spouse)\b/i },
+  { key: "money", en: "Money / Finances", ko: "돈 / 재정", re: /\b(money|financ|salary|debt|invest|pay|income|expense|saving|afford|budget|wealth)\b/i },
+  { key: "timing", en: "Timing", ko: "시기", re: /\b(january|february|march|april|may|june|july|august|september|october|november|december|week|month|year|soon|spring|summer|fall|autumn|winter|days?\b|next\s)/i },
+  { key: "warning", en: "Things to Be Careful About", ko: "주의할 점", re: /\b(careful|warning|caution|avoid|watch out|don'?t|beware|risk|danger|toxic|negative)\b/i },
+  { key: "health", en: "Health", ko: "건강", re: /\b(health|sick|doctor|hospital|stress|anxiety|sleep|energy|tired|body|mental)\b/i },
+];
+
+function structureTranscript(transcript: string, korean: boolean): string {
+  const lines = transcript
+    .trim()
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  if (lines.length === 0) return "";
+
+  // Assign each line to the first matching topic, or "general"
+  const buckets = new Map<string, string[]>();
+
+  for (const line of lines) {
+    let assigned = false;
+    for (const topic of TOPIC_PATTERNS) {
+      if (topic.re.test(line)) {
+        if (!buckets.has(topic.key)) buckets.set(topic.key, []);
+        buckets.get(topic.key)!.push(line);
+        assigned = true;
+        break;
+      }
+    }
+    if (!assigned) {
+      if (!buckets.has("general")) buckets.set("general", []);
+      buckets.get("general")!.push(line);
+    }
+  }
+
+  // Build output with dynamic headings — only sections that have content
+  const sections: string[] = [];
+
+  for (const topic of TOPIC_PATTERNS) {
+    const bucket = buckets.get(topic.key);
+    if (!bucket) continue;
+    const heading = korean ? topic.ko : topic.en;
+    sections.push(
+      `## ${heading}\n` + bucket.map((l) => `- ${l}`).join("\n")
     );
   }
 
-  return (
-    `Selection: ${req.selectedCard}\n\n` +
-    `## Reading Notes\n` +
-    req.transcript
-      .trim()
-      .split("\n")
-      .filter((line) => line.trim())
-      .map((line) => `- ${line.trim()}`)
-      .join("\n")
-  );
+  // General bucket last (only if there were also topic-specific buckets)
+  const general = buckets.get("general");
+  if (general) {
+    if (sections.length > 0) {
+      const heading = korean ? "기타" : "Other";
+      sections.push(
+        `## ${heading}\n` + general.map((l) => `- ${l}`).join("\n")
+      );
+    } else {
+      // Everything fell into general — no headings needed, just bullets
+      sections.push(general.map((l) => `- ${l}`).join("\n"));
+    }
+  }
+
+  return sections.join("\n\n");
 }
