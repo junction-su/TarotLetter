@@ -203,6 +203,12 @@ async function fetchWatchPage(videoId: string): Promise<WatchPageResult> {
     if (!res.ok) continue;
 
     const html = await res.text();
+    console.log("[metadata] status", res.status, "finalUrl", res.url);
+    console.log("[metadata] head", html.slice(0, 200));
+    console.log("[metadata] hasYTIPR", html.includes("ytInitialPlayerResponse"));
+    console.log("[metadata] hasPlayerResp", html.includes("playerResponse"));
+    console.log("[metadata] hasConsent", html.includes("consent.youtube.com"));
+
 
     const blocked = detectBlockedPage(html);
     if (blocked) {
