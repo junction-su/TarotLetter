@@ -54,6 +54,9 @@ export default function NewEntryPage() {
   const [activeChip, setActiveChip] = useState<number | null>(null);
   const [showCustomDate, setShowCustomDate] = useState(false);
 
+  // Transcript / notes
+  const [transcript, setTranscript] = useState("");
+
   // Summary
   const [summaryLang, setSummaryLang] = useState<SummaryLanguage>("auto");
   const [aiSummary, setAiSummary] = useState("");
@@ -104,6 +107,7 @@ export default function NewEntryPage() {
       selectedCard: effectiveCard,
       language: summaryLang,
       isKoreanContent: isKorean,
+      transcript: transcript,
     });
     setAiSummary(summary);
     setSummaryGenerated(true);
@@ -121,6 +125,7 @@ export default function NewEntryPage() {
       channelName: videoMeta.channelName,
       createdAt: new Date().toISOString(),
       selectedCard: effectiveCard,
+      transcript,
       aiSummary,
       revisitDate,
       outcomeStatus: "none",
@@ -308,7 +313,27 @@ export default function NewEntryPage() {
         </section>
       )}
 
-      {/* ── Step 5: Summary ── */}
+      {/* ── Step 5: Transcript / Notes ── */}
+      {fetched && (
+        <section className="space-y-3">
+          <label className="block text-sm text-mist/60">
+            What did the reader say?
+          </label>
+          <p className="text-xs text-mist/40">
+            Paste the transcript or type your notes from the reading. Only what
+            you write here will appear in the summary — nothing is invented.
+          </p>
+          <textarea
+            value={transcript}
+            onChange={(e) => setTranscript(e.target.value)}
+            rows={6}
+            placeholder="e.g., The reader said there's a job offer coming in March, possibly from someone you already know. They warned about signing contracts too quickly…"
+            className="w-full rounded-lg border border-twilight bg-dusk px-4 py-3 text-sm leading-relaxed text-cream placeholder-mist/30 outline-none transition-colors focus:border-violet/60"
+          />
+        </section>
+      )}
+
+      {/* ── Step 6: Summary ── */}
       {fetched && (
         <section className="space-y-3">
           <div className="flex items-center justify-between">

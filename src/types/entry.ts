@@ -7,6 +7,7 @@ export interface TarotEntry {
   channelName: string;
   createdAt: string; // ISO date string
   selectedCard: string;
+  transcript: string; // raw notes or transcript from the reading
   aiSummary: string;
   revisitDate: string; // ISO date string
   outcomeStatus: OutcomeStatus;

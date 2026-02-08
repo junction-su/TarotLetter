@@ -109,6 +109,20 @@ export default function EntryDetailPage() {
         </a>
       )}
 
+      {/* Transcript / Notes */}
+      {entry.transcript && (
+        <section>
+          <h2 className="mb-3 text-sm font-medium uppercase tracking-widest text-lavender/50">
+            What the Reader Said
+          </h2>
+          <div className="rounded-xl border border-twilight bg-dusk/40 p-5">
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-mist/80">
+              {entry.transcript}
+            </p>
+          </div>
+        </section>
+      )}
+
       {/* AI Summary */}
       <section>
         <h2 className="mb-3 text-sm font-medium uppercase tracking-widest text-lavender/50">
