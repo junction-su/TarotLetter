@@ -1,5 +1,7 @@
 // src/app/api/transcript/route.ts
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 
 import { NextRequest, NextResponse } from "next/server";
 
