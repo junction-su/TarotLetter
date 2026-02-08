@@ -108,22 +108,41 @@ export function parseTimecodes(text: string): TimecodeOption[] {
 }
 
 /**
- * Attempt to fetch transcript text via the server-side API route.
- * Returns the transcript string, or null if captions are unavailable.
+ * Result from the transcript fetch API.
+ * On success: transcript is a string, reason is null.
+ * On failure: transcript is null, reason indicates why.
  */
-export async function fetchTranscript(url: string): Promise<string | null> {
+export interface TranscriptResult {
+  transcript: string | null;
+  reason:
+    | "CONSENT_PAGE"
+    | "AGE_RESTRICTED"
+    | "PLAYER_RESPONSE_NOT_FOUND"
+    | "NO_CAPTIONS"
+    | "CAPTION_FETCH_FAILED"
+    | null;
+}
+
+/**
+ * Attempt to fetch transcript text via the server-side API route.
+ * Returns { transcript, reason } — reason is null on success.
+ */
+export async function fetchTranscript(url: string): Promise<TranscriptResult> {
   const videoId = extractVideoId(url);
-  if (!videoId) return null;
+  if (!videoId) return { transcript: null, reason: "PLAYER_RESPONSE_NOT_FOUND" };
 
   try {
     const res = await fetch(
       `/api/transcript?v=${encodeURIComponent(videoId)}`
     );
-    if (!res.ok) return null;
-    const data: { transcript: string | null } = await res.json();
-    return data.transcript ?? null;
+    if (!res.ok) return { transcript: null, reason: "CAPTION_FETCH_FAILED" };
+    const data: TranscriptResult = await res.json();
+    return {
+      transcript: data.transcript ?? null,
+      reason: data.reason ?? null,
+    };
   } catch {
-    return null;
+    return { transcript: null, reason: "CAPTION_FETCH_FAILED" };
   }
 }
 

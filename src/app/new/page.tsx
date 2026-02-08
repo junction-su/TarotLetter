@@ -60,6 +60,9 @@ export default function NewEntryPage() {
   const [transcriptStatus, setTranscriptStatus] = useState<
     "idle" | "loading" | "auto" | "manual"
   >("idle");
+  const [transcriptFailReason, setTranscriptFailReason] = useState<
+    string | null
+  >(null);
   const [showCopyHelp, setShowCopyHelp] = useState(false);
 
   // Summary
@@ -88,11 +91,13 @@ export default function NewEntryPage() {
 
       // Attempt transcript auto-fetch in background
       setTranscriptStatus("loading");
-      const text = await fetchTranscript(youtubeUrl);
-      if (text) {
-        setTranscript(text);
+      setTranscriptFailReason(null);
+      const result = await fetchTranscript(youtubeUrl);
+      if (result.transcript) {
+        setTranscript(result.transcript);
         setTranscriptStatus("auto");
       } else {
+        setTranscriptFailReason(result.reason);
         setTranscriptStatus("manual");
       }
     } else {
@@ -348,8 +353,16 @@ export default function NewEntryPage() {
           {transcriptStatus === "manual" && (
             <div className="space-y-1">
               <p className="text-xs text-gold/80">
-                Transcript not available for this video. Paste it manually
-                below.
+                {transcriptFailReason === "CONSENT_PAGE"
+                  ? "YouTube returned a consent/cookie page. The transcript couldn\u2019t be fetched automatically."
+                  : transcriptFailReason === "AGE_RESTRICTED"
+                    ? "This video is age-restricted. YouTube requires a login to access its transcript."
+                    : transcriptFailReason === "NO_CAPTIONS"
+                      ? "This video has no captions available on YouTube."
+                      : transcriptFailReason === "PLAYER_RESPONSE_NOT_FOUND"
+                        ? "Couldn\u2019t read the video page. The video may be private or unavailable."
+                        : "Transcript not available for this video."}{" "}
+                Paste it manually below.
               </p>
               <button
                 type="button"
