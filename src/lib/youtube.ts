@@ -120,29 +120,36 @@ export interface TranscriptResult {
     | "PLAYER_RESPONSE_NOT_FOUND"
     | "NO_CAPTIONS"
     | "CAPTION_FETCH_FAILED"
+    | "ASR_NOT_CONFIGURED"
     | null;
+  description: string | null;
 }
 
 /**
  * Attempt to fetch transcript text via the server-side API route.
- * Returns { transcript, reason } — reason is null on success.
+ * Also returns the video description (for timestamp parsing).
  */
 export async function fetchTranscript(url: string): Promise<TranscriptResult> {
   const videoId = extractVideoId(url);
-  if (!videoId) return { transcript: null, reason: "PLAYER_RESPONSE_NOT_FOUND" };
+  if (!videoId) {
+    return { transcript: null, reason: "PLAYER_RESPONSE_NOT_FOUND", description: null };
+  }
 
   try {
     const res = await fetch(
       `/api/transcript?v=${encodeURIComponent(videoId)}`
     );
-    if (!res.ok) return { transcript: null, reason: "CAPTION_FETCH_FAILED" };
+    if (!res.ok) {
+      return { transcript: null, reason: "CAPTION_FETCH_FAILED", description: null };
+    }
     const data: TranscriptResult = await res.json();
     return {
       transcript: data.transcript ?? null,
       reason: data.reason ?? null,
+      description: data.description ?? null,
     };
   } catch {
-    return { transcript: null, reason: "CAPTION_FETCH_FAILED" };
+    return { transcript: null, reason: "CAPTION_FETCH_FAILED", description: null };
   }
 }
 

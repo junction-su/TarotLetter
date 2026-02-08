@@ -44,7 +44,7 @@ export default function NewEntryPage() {
   const [fetchError, setFetchError] = useState(false);
   const [videoMeta, setVideoMeta] = useState<VideoMeta | null>(null);
 
-  // Timecodes extracted from title (oEmbed doesn't give description)
+  // Timecodes extracted from title + description
   const [timecodeOptions, setTimecodeOptions] = useState<TimecodeOption[]>([]);
   const [isKorean, setIsKorean] = useState(false);
 
@@ -85,14 +85,27 @@ export default function NewEntryPage() {
     const meta = await fetchVideoMeta(youtubeUrl);
     if (meta) {
       setVideoMeta(meta);
-      const tc = parseTimecodes(meta.title);
-      setTimecodeOptions(tc);
+      // Initial timecodes from title (description not available yet)
+      const titleTc = parseTimecodes(meta.title);
+      setTimecodeOptions(titleTc);
       setIsKorean(containsKorean(meta.title));
 
-      // Attempt transcript auto-fetch in background
+      // Fetch transcript + description from watch page
       setTranscriptStatus("loading");
       setTranscriptFailReason(null);
       const result = await fetchTranscript(youtubeUrl);
+
+      // Merge description timecodes (prefer description — it usually has
+      // the full timestamp list, while titles may only have a few)
+      if (result.description) {
+        const descTc = parseTimecodes(result.description);
+        setTimecodeOptions(descTc.length > 0 ? descTc : titleTc);
+        // Also detect Korean from description if title didn't match
+        if (!containsKorean(meta.title) && containsKorean(result.description)) {
+          setIsKorean(true);
+        }
+      }
+
       if (result.transcript) {
         setTranscript(result.transcript);
         setTranscriptStatus("auto");
@@ -222,7 +235,7 @@ export default function NewEntryPage() {
             Which card did you choose?
           </label>
 
-          {/* Timecode-based options (if found) */}
+          {/* Timecode-based options from video title / description */}
           {timecodeOptions.length > 0 && (
             <div className="space-y-1.5">
               <p className="text-xs text-mist/40">From video</p>
@@ -244,21 +257,27 @@ export default function NewEntryPage() {
             </div>
           )}
 
-          {/* Fallback options */}
+          {/* Fallback Card 1-4 only when no timestamps were found */}
+          {timecodeOptions.length === 0 && (
+            <div className="flex flex-wrap gap-2">
+              {FALLBACK_CARDS.map((card) => (
+                <button
+                  key={card}
+                  onClick={() => setSelectedCard(card)}
+                  className={`rounded-lg border px-3 py-2 text-sm transition-colors ${
+                    selectedCard === card
+                      ? "border-violet bg-violet/20 text-violet-glow"
+                      : "border-twilight/60 text-mist/60 hover:border-violet/40 hover:text-mist/80"
+                  }`}
+                >
+                  {card}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Custom option — always available */}
           <div className="flex flex-wrap gap-2">
-            {FALLBACK_CARDS.map((card) => (
-              <button
-                key={card}
-                onClick={() => setSelectedCard(card)}
-                className={`rounded-lg border px-3 py-2 text-sm transition-colors ${
-                  selectedCard === card
-                    ? "border-violet bg-violet/20 text-violet-glow"
-                    : "border-twilight/60 text-mist/60 hover:border-violet/40 hover:text-mist/80"
-                }`}
-              >
-                {card}
-              </button>
-            ))}
             <button
               onClick={() => setSelectedCard("Custom")}
               className={`rounded-lg border px-3 py-2 text-sm transition-colors ${
@@ -361,7 +380,9 @@ export default function NewEntryPage() {
                       ? "This video has no captions available on YouTube."
                       : transcriptFailReason === "PLAYER_RESPONSE_NOT_FOUND"
                         ? "Couldn\u2019t read the video page. The video may be private or unavailable."
-                        : "Transcript not available for this video."}{" "}
+                        : transcriptFailReason === "ASR_NOT_CONFIGURED"
+                          ? "No captions found and automatic speech recognition is not configured."
+                          : "Transcript not available for this video."}{" "}
                 Paste it manually below.
               </p>
               <button
