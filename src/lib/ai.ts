@@ -107,13 +107,30 @@ export async function generateReadingSummary(
 // ── Simple keyword-based grouping for MVP (no LLM) ──
 
 const TOPIC_PATTERNS: { key: string; en: string; ko: string; re: RegExp }[] = [
-  { key: "work", en: "Work / Career", ko: "직장 / 커리어", re: /\b(job|work|career|boss|company|promotion|office|business|interview|hire|fired|resign|colleague)\b/i },
-  { key: "love", en: "Love / Relationships", ko: "연애 / 관계", re: /\b(love|relationship|partner|ex|dating|marriage|boyfriend|girlfriend|crush|breakup|romantic|spouse)\b/i },
-  { key: "money", en: "Money / Finances", ko: "돈 / 재정", re: /\b(money|financ|salary|debt|invest|pay|income|expense|saving|afford|budget|wealth)\b/i },
-  { key: "timing", en: "Timing", ko: "시기", re: /\b(january|february|march|april|may|june|july|august|september|october|november|december|week|month|year|soon|spring|summer|fall|autumn|winter|days?\b|next\s)/i },
-  { key: "warning", en: "Things to Be Careful About", ko: "주의할 점", re: /\b(careful|warning|caution|avoid|watch out|don'?t|beware|risk|danger|toxic|negative)\b/i },
-  { key: "health", en: "Health", ko: "건강", re: /\b(health|sick|doctor|hospital|stress|anxiety|sleep|energy|tired|body|mental)\b/i },
+  { key: "work", en: "Work / Career", ko: "직장 / 커리어", re: /\b(job|work|career|boss|company|promotion|office|business|interview|hire|fired|resign|colleague|coworker|manager|project)\b/i },
+  { key: "love", en: "Love / Relationships", ko: "연애 / 관계", re: /\b(love|relationship|partner|ex|dating|marriage|boyfriend|girlfriend|crush|breakup|romantic|spouse|husband|wife)\b/i },
+  { key: "money", en: "Money / Finances", ko: "돈 / 재정", re: /\b(money|financ|salary|debt|invest|pay|income|expense|saving|afford|budget|wealth|cost|price)\b/i },
+  { key: "timing", en: "Timing", ko: "시기", re: /\b(january|february|march|april|may|june|july|august|september|october|november|december|weeks?|months?|years?|soon|spring|summer|fall|autumn|winter|days?|next\s|by\s(the\s)?end)/i },
+  { key: "warning", en: "Things to Be Careful About", ko: "주의할 점", re: /\b(careful|warning|caution|avoid|watch\s?out|don'?t|beware|risk|danger|toxic|negative|red\s?flag)\b/i },
+  { key: "health", en: "Health", ko: "건강", re: /\b(health|sick|doctor|hospital|stress|anxiety|sleep|energy|tired|body|mental|burn\s?out)\b/i },
 ];
+
+/** Filler patterns — lines matching these carry no reading-specific info. */
+const FILLER_RE = /^(um+|uh+|okay|ok|so|yeah|yes|no|right|like|you know|anyway|alright|let'?s see|moving on|here we go)[\s.,!?]*$/i;
+
+/** Minimum word count for a line to be considered information-dense. */
+const MIN_WORDS = 4;
+
+/**
+ * Returns true if a line is information-dense enough to keep.
+ * Drops pure filler, very short fragments, and lines that are only
+ * punctuation / whitespace after trimming.
+ */
+function isDense(line: string): boolean {
+  if (FILLER_RE.test(line)) return false;
+  const wordCount = line.split(/\s+/).filter((w) => w.length > 0).length;
+  return wordCount >= MIN_WORDS;
+}
 
 function structureTranscript(transcript: string, korean: boolean): string {
   const lines = transcript
@@ -124,10 +141,16 @@ function structureTranscript(transcript: string, korean: boolean): string {
 
   if (lines.length === 0) return "";
 
+  // Keep only information-dense lines
+  const dense = lines.filter(isDense);
+
+  // If filtering removed everything, fall back to all non-empty lines
+  const usable = dense.length > 0 ? dense : lines;
+
   // Assign each line to the first matching topic, or "general"
   const buckets = new Map<string, string[]>();
 
-  for (const line of lines) {
+  for (const line of usable) {
     let assigned = false;
     for (const topic of TOPIC_PATTERNS) {
       if (topic.re.test(line)) {
@@ -155,7 +178,7 @@ function structureTranscript(transcript: string, korean: boolean): string {
     );
   }
 
-  // General bucket last (only if there were also topic-specific buckets)
+  // General bucket: use heading only when topic sections also exist
   const general = buckets.get("general");
   if (general) {
     if (sections.length > 0) {
