@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-/**
- * Failure reasons returned when transcript extraction fails.
- * The client uses these to show context-specific fallback messages.
- */
+// ── Types ──
+
 export type TranscriptFailReason =
   | "CONSENT_PAGE"
   | "AGE_RESTRICTED"
@@ -12,28 +10,59 @@ export type TranscriptFailReason =
   | "CAPTION_FETCH_FAILED"
   | "ASR_NOT_CONFIGURED";
 
+/** Which extraction path produced the transcript. */
+export type TranscriptStrategy =
+  | "caption_tracks"
+  | "timedtext_api"
+  | "asr"
+  | null;
+
 interface TranscriptSuccess {
   transcript: string;
   reason: null;
   description: string | null;
+  strategy: TranscriptStrategy;
 }
 
 interface TranscriptFailure {
   transcript: null;
   reason: TranscriptFailReason;
   description: string | null;
+  strategy: null;
 }
 
 type TranscriptResult = TranscriptSuccess | TranscriptFailure;
 
+// ── Shared browser-like request headers ──
+
+const BROWSER_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+  "Sec-Ch-Ua":
+    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "Sec-Ch-Ua-Mobile": "?0",
+  "Sec-Ch-Ua-Platform": '"Windows"',
+  Referer: "https://www.youtube.com/",
+  // SOCS cookie = pre-accepted GDPR consent (value from a real accept-all)
+  Cookie: "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNTI4LjA3X3AxGgJlbiACGgYIgMCxsgY; CONSENT=PENDING+987",
+};
+
 /**
  * GET /api/transcript?v=VIDEO_ID
  *
- * 1. Fetches the YouTube watch page and extracts the player response.
- * 2. Returns the video description (for timestamp / card parsing).
- * 3. Tries YouTube captions first.
- * 4. If no captions, falls back to an ASR stub (Whisper-compatible).
- * 5. Returns { transcript, reason, description }.
+ * Strategy chain:
+ *   1. Fetch YouTube watch page (hl=ko → hl=en fallback) and extract
+ *      captionTracks from ytInitialPlayerResponse.
+ *   2. If captionTracks unavailable, try YouTube timedtext API directly.
+ *   3. If still nothing, try external ASR stub.
+ *   4. Return { transcript, reason, description, strategy }.
  */
 export async function GET(req: NextRequest) {
   const videoId = req.nextUrl.searchParams.get("v");
@@ -41,76 +70,42 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Invalid video ID" }, { status: 400 });
   }
 
-  // description is extracted early and returned in every response so the
-  // client can parse timestamp-based card options regardless of transcript
-  // availability.
   let description: string | null = null;
 
   try {
-    // ── 1. Fetch the YouTube watch page ──
-    const watchRes = await fetch(
-      `https://www.youtube.com/watch?v=${videoId}&hl=en`,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept-Language": "en-US,en;q=0.9",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-      }
-    );
+    // ── 1. Fetch watch page (try hl=ko first, then hl=en) ──
+    const pageResult = await fetchWatchPage(videoId);
 
-    if (!watchRes.ok) {
-      return fail("PLAYER_RESPONSE_NOT_FOUND", description);
+    if (pageResult.blocked) {
+      return fail(pageResult.blocked, description);
     }
 
-    const html = await watchRes.text();
+    const playerResponse = pageResult.playerResponse;
+    if (!playerResponse) {
+      // Neither language variant yielded a player response — try
+      // timedtext API directly (step 2) before giving up.
+      const ttText = await tryTimedtextApi(videoId);
+      if (ttText) return ok(ttText, description, "timedtext_api");
 
-    // ── 2. Detect consent / cookie-wall pages ──
-    if (
-      html.includes("consent.youtube.com") ||
-      html.includes("accounts.google.com/ServiceLogin") ||
-      html.includes('action="https://consent.google.com')
-    ) {
-      return fail("CONSENT_PAGE", description);
+      const asrText = await tryAsr(videoId);
+      if (asrText) return ok(asrText, description, "asr");
+
+      return fail(
+        process.env.ASR_ENDPOINT ? "PLAYER_RESPONSE_NOT_FOUND" : "ASR_NOT_CONFIGURED",
+        description,
+      );
     }
 
-    // ── 3. Detect age-restricted content ──
-    if (
-      html.includes("og:restrictions:age") ||
-      html.includes('"reason":"Sign in to confirm your age"') ||
-      html.includes("playerLegacyDesktopYpcOfferRenderer")
-    ) {
-      return fail("AGE_RESTRICTED", description);
-    }
-
-    // ── 4. Extract ytInitialPlayerResponse JSON ──
-    const prMatch = html.match(
-      /ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*<\/script/s
-    );
-    if (!prMatch) {
-      return fail("PLAYER_RESPONSE_NOT_FOUND", description);
-    }
-
-    let playerResponse: Record<string, unknown>;
-    try {
-      playerResponse = JSON.parse(prMatch[1]);
-    } catch {
-      return fail("PLAYER_RESPONSE_NOT_FOUND", description);
-    }
-
-    // ── 5. Extract video description ──
-    const videoDetails = playerResponse?.videoDetails as
+    // ── Extract description ──
+    const videoDetails = playerResponse.videoDetails as
       | { shortDescription?: string }
       | undefined;
     description = videoDetails?.shortDescription ?? null;
 
-    // ── 6. Check for age-gate inside player response ──
-    const playability = playerResponse?.playabilityStatus as
+    // ── Age-gate check ──
+    const playability = playerResponse.playabilityStatus as
       | { status?: string; reason?: string }
       | undefined;
-
     if (
       playability?.status === "LOGIN_REQUIRED" ||
       (playability?.reason && /age/i.test(playability.reason))
@@ -118,8 +113,8 @@ export async function GET(req: NextRequest) {
       return fail("AGE_RESTRICTED", description);
     }
 
-    // ── 7. Try YouTube captions ──
-    const captions = playerResponse?.captions as
+    // ── 2. Try captionTracks from player response ──
+    const captions = playerResponse.captions as
       | {
           playerCaptionsTracklistRenderer?: {
             captionTracks?: CaptionTrack[];
@@ -133,24 +128,27 @@ export async function GET(req: NextRequest) {
       const manual = tracks.find((t) => t.kind !== "asr");
       const track = manual ?? tracks[0];
 
-      const captionRes = await fetch(track.baseUrl);
+      const captionRes = await fetch(track.baseUrl, {
+        headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+      });
       if (captionRes.ok) {
         const xml = await captionRes.text();
         const segments = parseCaptionXml(xml);
         if (segments.length > 0) {
-          return ok(segments.join("\n"), description);
+          return ok(segments.join("\n"), description, "caption_tracks");
         }
       }
-      // caption fetch failed — fall through to ASR
     }
 
-    // ── 8. ASR fallback ──
+    // ── 3. Timedtext API fallback ──
+    const ttText = await tryTimedtextApi(videoId);
+    if (ttText) return ok(ttText, description, "timedtext_api");
+
+    // ── 4. ASR fallback ──
     const asrText = await tryAsr(videoId);
-    if (asrText) {
-      return ok(asrText, description);
-    }
+    if (asrText) return ok(asrText, description, "asr");
 
-    // Both paths failed — pick the most accurate reason
+    // All strategies exhausted
     const reason: TranscriptFailReason =
       !tracks || tracks.length === 0
         ? process.env.ASR_ENDPOINT
@@ -164,13 +162,18 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// ── response helpers ──
+// ── Response helpers ──
 
-function ok(transcript: string, description: string | null) {
+function ok(
+  transcript: string,
+  description: string | null,
+  strategy: TranscriptStrategy,
+) {
   return NextResponse.json<TranscriptResult>({
     transcript,
     reason: null,
     description,
+    strategy,
   });
 }
 
@@ -179,10 +182,89 @@ function fail(reason: TranscriptFailReason, description: string | null) {
     transcript: null,
     reason,
     description,
+    strategy: null,
   });
 }
 
-// ── caption XML parsing ──
+// ── Watch page fetch with hl fallback ──
+
+interface WatchPageResult {
+  playerResponse: Record<string, unknown> | null;
+  blocked: TranscriptFailReason | null;
+}
+
+/**
+ * Fetch the YouTube watch page. Tries hl=ko first (many tarot readings
+ * are Korean), then hl=en as a fallback. Returns the parsed
+ * playerResponse, or a blocking reason if the page can't be used.
+ */
+async function fetchWatchPage(videoId: string): Promise<WatchPageResult> {
+  for (const hl of ["ko", "en"]) {
+    const res = await fetch(
+      `https://www.youtube.com/watch?v=${videoId}&hl=${hl}&persist_hl=1&bpctr=9999999999`,
+      { headers: BROWSER_HEADERS },
+    );
+
+    if (!res.ok) continue;
+
+    const html = await res.text();
+
+    // Consent / cookie-wall detection
+    const blocked = detectBlockedPage(html);
+    if (blocked) {
+      // If the first hl hit consent, the second likely will too — but
+      // try once more with the other language before giving up.
+      if (hl === "ko") continue;
+      return { playerResponse: null, blocked };
+    }
+
+    // Extract ytInitialPlayerResponse
+    const pr = extractPlayerResponse(html);
+    if (pr) return { playerResponse: pr, blocked: null };
+  }
+
+  return { playerResponse: null, blocked: null };
+}
+
+function detectBlockedPage(html: string): TranscriptFailReason | null {
+  // Consent page indicators (GDPR cookie walls)
+  if (
+    html.includes("consent.youtube.com") ||
+    html.includes("accounts.google.com/ServiceLogin") ||
+    html.includes('action="https://consent.google.com') ||
+    html.includes("CONSENT_PENDING") ||
+    (html.includes("<form") && html.includes("consent") && !html.includes("ytInitialPlayerResponse"))
+  ) {
+    return "CONSENT_PAGE";
+  }
+
+  // Age-restriction indicators in raw HTML
+  if (
+    html.includes("og:restrictions:age") ||
+    html.includes('"reason":"Sign in to confirm your age"') ||
+    html.includes("playerLegacyDesktopYpcOfferRenderer")
+  ) {
+    return "AGE_RESTRICTED";
+  }
+
+  return null;
+}
+
+function extractPlayerResponse(
+  html: string,
+): Record<string, unknown> | null {
+  const m = html.match(
+    /ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\});\s*<\/script/,
+  );
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]);
+  } catch {
+    return null;
+  }
+}
+
+// ── Caption XML parsing ──
 
 interface CaptionTrack {
   baseUrl: string;
@@ -209,17 +291,63 @@ function decodeXmlEntities(s: string): string {
     .replace(/&#39;/g, "'");
 }
 
+// ── Timedtext API fallback ──
+
+/**
+ * Attempt to fetch captions using YouTube's timedtext API directly.
+ * This can succeed even when the watch page scraping fails, because it
+ * doesn't require parsing HTML — it's a clean JSON/XML endpoint.
+ *
+ * Tries auto-generated captions for several common languages.
+ */
+async function tryTimedtextApi(videoId: string): Promise<string | null> {
+  // Try auto-generated captions in order of likelihood for tarot content
+  const langs = ["ko", "en", "ja", "es"];
+
+  for (const lang of langs) {
+    try {
+      const url =
+        `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`;
+      const res = await fetch(url, {
+        headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+      });
+      if (!res.ok) continue;
+
+      const xml = await res.text();
+      // srv3 format is also XML with <text> elements
+      const segments = parseCaptionXml(xml);
+      if (segments.length > 0) return segments.join("\n");
+    } catch {
+      // Try next language
+    }
+  }
+
+  // Also try the auto-detect endpoint (asr)
+  try {
+    const url =
+      `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=srv3`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+    });
+    if (res.ok) {
+      const xml = await res.text();
+      const segments = parseCaptionXml(xml);
+      if (segments.length > 0) return segments.join("\n");
+    }
+  } catch {
+    // Fall through
+  }
+
+  return null;
+}
+
 // ── ASR fallback stub ──
 
 /**
  * Attempt speech-to-text via an external ASR service (e.g. Whisper).
  *
- * Requires the ASR_ENDPOINT env var to be set (e.g.
- * "http://localhost:9000"). When configured the stub POSTs
- * { videoId } to ASR_ENDPOINT/transcribe and expects
- * { transcript: string } back.
- *
- * Returns null when ASR is not configured or the call fails.
+ * Requires the ASR_ENDPOINT env var to be set. POSTs { videoId } to
+ * ASR_ENDPOINT/transcribe and expects { transcript: string } back.
  */
 async function tryAsr(videoId: string): Promise<string | null> {
   const endpoint = process.env.ASR_ENDPOINT;

@@ -65,6 +65,9 @@ export default function NewEntryPage() {
   const [transcriptFailReason, setTranscriptFailReason] = useState<
     string | null
   >(null);
+  const [transcriptStrategy, setTranscriptStrategy] = useState<
+    string | null
+  >(null);
   const [showCopyHelp, setShowCopyHelp] = useState(false);
 
   // Summary
@@ -118,7 +121,15 @@ export default function NewEntryPage() {
     // ── 2. Parse timestamps from description (primary) or title (fallback) ──
     const descTc = description ? parseTimecodes(description) : [];
     const titleTc = parseTimecodes(title);
-    setTimecodeOptions(descTc.length > 0 ? descTc : titleTc);
+    const finalTc = descTc.length > 0 ? descTc : titleTc;
+    setTimecodeOptions(finalTc);
+
+    if (process.env.NODE_ENV === "development") {
+      console.debug(
+        `[timestamps] found ${finalTc.length} from ${descTc.length > 0 ? "description" : "title"}:`,
+        finalTc.map((tc) => `${tc.label} @ ${tc.time}`)
+      );
+    }
 
     // Korean detection from title + description
     setIsKorean(
@@ -134,8 +145,10 @@ export default function NewEntryPage() {
     if (result.transcript) {
       setTranscript(result.transcript);
       setTranscriptStatus("auto");
+      setTranscriptStrategy(result.strategy);
     } else {
       setTranscriptFailReason(result.reason);
+      setTranscriptStrategy(result.strategy);
       setTranscriptStatus("manual");
     }
 
@@ -399,7 +412,7 @@ export default function NewEntryPage() {
             <div className="space-y-1">
               <p className="text-xs text-gold/80">
                 {transcriptFailReason === "CONSENT_PAGE"
-                  ? "YouTube returned a consent/cookie page. The transcript couldn\u2019t be fetched automatically."
+                  ? "Auto-import blocked by YouTube. Both server and browser fetches failed."
                   : transcriptFailReason === "AGE_RESTRICTED"
                     ? "This video is age-restricted. YouTube requires a login to access its transcript."
                     : transcriptFailReason === "NO_CAPTIONS"
@@ -409,7 +422,7 @@ export default function NewEntryPage() {
                         : transcriptFailReason === "ASR_NOT_CONFIGURED"
                           ? "No captions found and automatic speech recognition is not configured."
                           : "Transcript not available for this video."}{" "}
-                Paste it manually below.
+                Please paste transcript manually.
               </p>
               <button
                 type="button"
@@ -509,6 +522,45 @@ export default function NewEntryPage() {
             />
           )}
         </section>
+      )}
+
+      {/* ── Dev Debug Panel ── */}
+      {process.env.NODE_ENV === "development" && fetched && (
+        <details className="rounded-lg border border-twilight/40 bg-dusk/50 text-xs text-mist/50">
+          <summary className="cursor-pointer px-4 py-2 select-none hover:text-mist/70">
+            Debug info
+          </summary>
+          <div className="space-y-1 border-t border-twilight/30 px-4 py-3">
+            <p>
+              <span className="text-mist/30">Video ID:</span>{" "}
+              {extractVideoId(youtubeUrl) ?? "—"}
+            </p>
+            <p>
+              <span className="text-mist/30">Timestamps:</span>{" "}
+              {timecodeOptions.length > 0
+                ? timecodeOptions
+                    .map((tc) => `${tc.label} @ ${tc.time}`)
+                    .join(", ")
+                : "none (using fallback cards)"}
+            </p>
+            <p>
+              <span className="text-mist/30">Transcript status:</span>{" "}
+              {transcriptStatus}
+            </p>
+            <p>
+              <span className="text-mist/30">Transcript strategy:</span>{" "}
+              {transcriptStrategy ?? "—"}
+            </p>
+            <p>
+              <span className="text-mist/30">Fail reason:</span>{" "}
+              {transcriptFailReason ?? "—"}
+            </p>
+            <p>
+              <span className="text-mist/30">Korean detected:</span>{" "}
+              {isKorean ? "yes" : "no"}
+            </p>
+          </div>
+        </details>
       )}
 
       {/* ── Save ── */}
