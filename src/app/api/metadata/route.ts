@@ -1,3 +1,6 @@
+// src/app/api/metadata/route.ts
+export const runtime = "nodejs";
+
 import { NextRequest, NextResponse } from "next/server";
 
 export type MetadataFailReason =
@@ -27,8 +30,9 @@ const BROWSER_HEADERS: Record<string, string> = {
   "Sec-Ch-Ua-Mobile": "?0",
   "Sec-Ch-Ua-Platform": '"Windows"',
   Referer: "https://www.youtube.com/",
-  Cookie:
-    "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNTI4LjA3X3AxGgJlbiACGgYIgMCxsgY; CONSENT=PENDING+987",
+  // 서버에서 이 쿠키로 뚫리는 환경도 있고, 안 되는 환경도 있음.
+  // PENDING은 오히려 차단 트리거가 되기도 해서 빼는 편이 낫다.
+  Cookie: "CONSENT=YES+1; SOCS=CAI;",
 };
 
 function fail(reason: MetadataFailReason): NextResponse<MetadataResult> {
@@ -40,15 +44,6 @@ function fail(reason: MetadataFailReason): NextResponse<MetadataResult> {
   });
 }
 
-/**
- * GET /api/metadata?v=VIDEO_ID
- *
- * Lightweight route that fetches the YouTube watch page and extracts
- * title, channelName and description from ytInitialPlayerResponse.
- * Uses hardened browser-like headers with GDPR consent cookies.
- * Tries hl=ko first, then hl=en fallback.
- * Does NOT fetch captions — use /api/transcript for that.
- */
 export async function GET(req: NextRequest) {
   const videoId = req.nextUrl.searchParams.get("v");
   if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
@@ -56,67 +51,40 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    for (const hl of ["ko", "en"]) {
-      const watchRes = await fetch(
-        `https://www.youtube.com/watch?v=${videoId}&hl=${hl}&persist_hl=1&bpctr=9999999999`,
-        { headers: BROWSER_HEADERS }
-      );
+    for (const hl of ["ko", "en"] as const) {
+      const watchUrl =
+        `https://www.youtube.com/watch?v=${videoId}` +
+        `&hl=${hl}&persist_hl=1&bpctr=9999999999&has_verified=1`;
+
+      const watchRes = await fetch(watchUrl, {
+        headers: BROWSER_HEADERS,
+        cache: "no-store",
+      });
 
       if (!watchRes.ok) continue;
 
       const html = await watchRes.text();
 
-      // Detect consent / cookie-wall
-      if (
-        html.includes("consent.youtube.com") ||
-        html.includes("accounts.google.com/ServiceLogin") ||
-        html.includes('action="https://consent.google.com') ||
-        html.includes("CONSENT_PENDING") ||
-        (html.includes("<form") &&
-          html.includes("consent") &&
-          !html.includes("ytInitialPlayerResponse"))
-      ) {
-        // Try other hl before giving up
+      const blocked = detectBlockedPage(html);
+      if (blocked) {
+        console.log("[api/metadata] BLOCKED:", blocked, "hl=", hl);
+        console.log("[api/metadata] BLOCKED HTML HEAD:", html.slice(0, 300));
         if (hl === "ko") continue;
-        return fail("CONSENT_PAGE");
+        return fail(blocked);
       }
 
-      // Detect age-restricted
-      if (
-        html.includes("og:restrictions:age") ||
-        html.includes('"reason":"Sign in to confirm your age"') ||
-        html.includes("playerLegacyDesktopYpcOfferRenderer")
-      ) {
-        return fail("AGE_RESTRICTED");
-      }
-
-      // Extract ytInitialPlayerResponse
-      const prMatch = html.match(
-        /ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\});\s*<\/script/
-      );
-      if (!prMatch) {
+      const pr = extractPlayerResponse(html);
+      if (!pr) {
         if (hl === "ko") continue;
         return fail("PLAYER_RESPONSE_NOT_FOUND");
       }
 
-      let playerResponse: Record<string, unknown>;
-      try {
-        playerResponse = JSON.parse(prMatch[1]);
-      } catch {
-        if (hl === "ko") continue;
-        return fail("PLAYER_RESPONSE_NOT_FOUND");
-      }
-
-      const videoDetails = playerResponse?.videoDetails as
+      const videoDetails = pr.videoDetails as
         | { title?: string; author?: string; shortDescription?: string }
         | undefined;
 
-      const microformat = playerResponse?.microformat as
-        | {
-            playerMicroformatRenderer?: {
-              ownerChannelName?: string;
-            };
-          }
+      const microformat = pr.microformat as
+        | { playerMicroformatRenderer?: { ownerChannelName?: string } }
         | undefined;
 
       const title = videoDetails?.title ?? null;
@@ -124,6 +92,7 @@ export async function GET(req: NextRequest) {
         microformat?.playerMicroformatRenderer?.ownerChannelName ??
         videoDetails?.author ??
         null;
+
       const description = videoDetails?.shortDescription ?? null;
 
       return NextResponse.json<MetadataResult>({
@@ -137,5 +106,41 @@ export async function GET(req: NextRequest) {
     return fail("PLAYER_RESPONSE_NOT_FOUND");
   } catch {
     return fail("PLAYER_RESPONSE_NOT_FOUND");
+  }
+}
+
+function detectBlockedPage(html: string): MetadataFailReason | null {
+  if (
+    html.includes("consent.youtube.com") ||
+    html.includes("accounts.google.com/ServiceLogin") ||
+    html.includes('action="https://consent.google.com') ||
+    html.includes("CONSENT_PENDING") ||
+    (html.includes("<form") &&
+      html.toLowerCase().includes("consent") &&
+      !html.includes("ytInitialPlayerResponse"))
+  ) {
+    return "CONSENT_PAGE";
+  }
+
+  if (
+    html.includes("og:restrictions:age") ||
+    html.includes('"reason":"Sign in to confirm your age"') ||
+    html.includes("playerLegacyDesktopYpcOfferRenderer")
+  ) {
+    return "AGE_RESTRICTED";
+  }
+
+  return null;
+}
+
+function extractPlayerResponse(html: string): Record<string, unknown> | null {
+  const m = html.match(
+    /ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\});\s*<\/script/,
+  );
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]);
+  } catch {
+    return null;
   }
 }
