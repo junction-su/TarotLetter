@@ -201,14 +201,14 @@ interface WatchPageResult {
  */
 async function fetchWatchPage(videoId: string): Promise<WatchPageResult> {
   for (const hl of ["ko", "en"]) {
-    const res = await fetch(
-      `https://www.youtube.com/watch?v=${videoId}&hl=${hl}&persist_hl=1&bpctr=9999999999`,
-      {
-        headers: BROWSER_HEADERS,
-        cache: "no-store",
+    const res = await fetch(watchUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
       },
-    );
-
+      cache: "no-store",
+    });
 
     if (!res.ok) continue;
 
