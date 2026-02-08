@@ -20,7 +20,7 @@
 body {
   background-color: var(--color-midnight);
   color: var(--color-cream);
-  font-family: var(--font-sans);
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
 ::-webkit-scrollbar {

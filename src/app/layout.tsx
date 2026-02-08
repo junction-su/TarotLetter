@@ -25,7 +25,7 @@ export default function RootLayout({
           rel="stylesheet"
         />
       </head>
-      <body className="min-h-screen antialiased">
+      <body className="min-h-screen font-sans antialiased">
         <header className="border-b border-twilight/40">
           <nav className="mx-auto flex max-w-2xl items-center justify-between px-4 py-4">
             <a
