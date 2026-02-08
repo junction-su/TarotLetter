@@ -5,8 +5,9 @@ export interface VideoMeta {
 }
 
 export interface TimecodeOption {
-  label: string;
+  label: string; // clean label without timestamp, e.g. "Pile 2"
   time: string; // "MM:SS" or "HH:MM:SS"
+  startSeconds: number;
 }
 
 /**
@@ -54,12 +55,52 @@ export async function fetchVideoMeta(url: string): Promise<VideoMeta | null> {
 }
 
 /**
+ * Result from the /api/metadata route.
+ */
+export interface MetadataResult {
+  title: string | null;
+  channelName: string | null;
+  description: string | null;
+  reason: string | null;
+}
+
+/**
+ * Fetch video metadata from the watch page (title, channel, description).
+ * Uses the server-side /api/metadata route to avoid CORS.
+ */
+export async function fetchMetadata(url: string): Promise<MetadataResult> {
+  const videoId = extractVideoId(url);
+  if (!videoId) {
+    return { title: null, channelName: null, description: null, reason: "PLAYER_RESPONSE_NOT_FOUND" };
+  }
+
+  try {
+    const res = await fetch(`/api/metadata?v=${encodeURIComponent(videoId)}`);
+    if (!res.ok) {
+      return { title: null, channelName: null, description: null, reason: "PLAYER_RESPONSE_NOT_FOUND" };
+    }
+    return await res.json();
+  } catch {
+    return { title: null, channelName: null, description: null, reason: "PLAYER_RESPONSE_NOT_FOUND" };
+  }
+}
+
+/**
  * Build a thumbnail URL for a YouTube video.
  */
 export function getThumbnailUrl(url: string): string | null {
   const id = extractVideoId(url);
   if (!id) return null;
   return `https://img.youtube.com/vi/${id}/mqdefault.jpg`;
+}
+
+/**
+ * Convert a time string like "12:34" or "1:02:30" to total seconds.
+ */
+export function timeToSeconds(time: string): number {
+  const parts = time.split(":").map(Number);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return parts[0] * 60 + parts[1];
 }
 
 /**
@@ -72,13 +113,12 @@ export function getThumbnailUrl(url: string): string | null {
  *   "Green Stone 12:44"
  *   "1:02:30 Final pile"
  *
- * Returns an array of { label, time } objects.
+ * Returns an array of { label, time, startSeconds } sorted by time.
  */
 export function parseTimecodes(text: string): TimecodeOption[] {
   if (!text) return [];
 
   const results: TimecodeOption[] = [];
-  // Match timecodes in HH:MM:SS or MM:SS or M:SS format
   const timePattern = /(\d{1,2}:\d{2}(?::\d{2})?)/g;
 
   const lines = text.split("\n");
@@ -89,7 +129,6 @@ export function parseTimecodes(text: string): TimecodeOption[] {
     const match = timePattern.exec(trimmed);
     if (match) {
       const time = match[1];
-      // Build label from the non-timecode part of the line
       const label = trimmed
         .replace(timePattern, "")
         .replace(/[-–—|()[\]]/g, " ")
@@ -97,13 +136,13 @@ export function parseTimecodes(text: string): TimecodeOption[] {
         .trim();
 
       if (label) {
-        results.push({ label: `${label} (${time})`, time });
+        results.push({ label, time, startSeconds: timeToSeconds(time) });
       }
     }
-    // Reset regex lastIndex for next line
     timePattern.lastIndex = 0;
   }
 
+  results.sort((a, b) => a.startSeconds - b.startSeconds);
   return results;
 }
 

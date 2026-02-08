@@ -5,8 +5,10 @@ import { useRouter } from "next/navigation";
 import { TarotEntry } from "@/types/entry";
 import { saveEntry, generateId } from "@/lib/storage";
 import {
+  fetchMetadata,
   fetchVideoMeta,
   fetchTranscript,
+  extractVideoId,
   parseTimecodes,
   containsKorean,
   type VideoMeta,
@@ -81,41 +83,62 @@ export default function NewEntryPage() {
     setFetching(true);
     setFetchError(false);
     setTranscriptStatus("idle");
+    setSelectedCard("");
 
-    const meta = await fetchVideoMeta(youtubeUrl);
-    if (meta) {
-      setVideoMeta(meta);
-      // Initial timecodes from title (description not available yet)
-      const titleTc = parseTimecodes(meta.title);
-      setTimecodeOptions(titleTc);
-      setIsKorean(containsKorean(meta.title));
+    // ── 1. Fetch metadata (title, channel, description) from watch page ──
+    const md = await fetchMetadata(youtubeUrl);
 
-      // Fetch transcript + description from watch page
-      setTranscriptStatus("loading");
-      setTranscriptFailReason(null);
-      const result = await fetchTranscript(youtubeUrl);
+    let title: string;
+    let channelName: string;
+    let description: string | null = null;
 
-      // Merge description timecodes (prefer description — it usually has
-      // the full timestamp list, while titles may only have a few)
-      if (result.description) {
-        const descTc = parseTimecodes(result.description);
-        setTimecodeOptions(descTc.length > 0 ? descTc : titleTc);
-        // Also detect Korean from description if title didn't match
-        if (!containsKorean(meta.title) && containsKorean(result.description)) {
-          setIsKorean(true);
-        }
-      }
-
-      if (result.transcript) {
-        setTranscript(result.transcript);
-        setTranscriptStatus("auto");
-      } else {
-        setTranscriptFailReason(result.reason);
-        setTranscriptStatus("manual");
-      }
+    if (md.title && md.channelName) {
+      title = md.title;
+      channelName = md.channelName;
+      description = md.description;
     } else {
-      setFetchError(true);
+      // Fallback to oEmbed (no description available)
+      const oEmbed = await fetchVideoMeta(youtubeUrl);
+      if (!oEmbed) {
+        setFetchError(true);
+        setFetching(false);
+        return;
+      }
+      title = oEmbed.title;
+      channelName = oEmbed.channelName;
     }
+
+    const videoId = extractVideoId(youtubeUrl);
+    const thumbnailUrl = videoId
+      ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`
+      : null;
+
+    setVideoMeta({ title, channelName, thumbnailUrl });
+
+    // ── 2. Parse timestamps from description (primary) or title (fallback) ──
+    const descTc = description ? parseTimecodes(description) : [];
+    const titleTc = parseTimecodes(title);
+    setTimecodeOptions(descTc.length > 0 ? descTc : titleTc);
+
+    // Korean detection from title + description
+    setIsKorean(
+      containsKorean(title) ||
+        (description ? containsKorean(description) : false)
+    );
+
+    // ── 3. Fetch transcript ──
+    setTranscriptStatus("loading");
+    setTranscriptFailReason(null);
+    const result = await fetchTranscript(youtubeUrl);
+
+    if (result.transcript) {
+      setTranscript(result.transcript);
+      setTranscriptStatus("auto");
+    } else {
+      setTranscriptFailReason(result.reason);
+      setTranscriptStatus("manual");
+    }
+
     setFetching(false);
   }
 
@@ -235,14 +258,14 @@ export default function NewEntryPage() {
             Which card did you choose?
           </label>
 
-          {/* Timecode-based options from video title / description */}
+          {/* Timecode-based options from video description / title */}
           {timecodeOptions.length > 0 && (
             <div className="space-y-1.5">
               <p className="text-xs text-mist/40">From video</p>
               <div className="flex flex-wrap gap-2">
                 {timecodeOptions.map((tc) => (
                   <button
-                    key={tc.time}
+                    key={tc.startSeconds}
                     onClick={() => setSelectedCard(tc.label)}
                     className={`rounded-lg border px-3 py-2 text-sm transition-colors ${
                       selectedCard === tc.label
@@ -251,6 +274,9 @@ export default function NewEntryPage() {
                     }`}
                   >
                     {tc.label}
+                    <span className="ml-1.5 text-xs text-mist/30">
+                      {tc.time}
+                    </span>
                   </button>
                 ))}
               </div>
