@@ -193,10 +193,11 @@ async function fetchWatchPage(videoId: string): Promise<WatchPageResult> {
   for (const hl of ["ko", "en"] as const) {
     const watchUrl =
       `https://www.youtube.com/watch?v=${videoId}` +
-      `&hl=${hl}&persist_hl=1&bpctr=9999999999&has_verified=1`;
-
+      `&hl=${hl}&gl=US&persist_hl=1&persist_gl=1&bpctr=9999999999&has_verified=1`;
+    
     const res = await fetch(watchUrl, {
-      headers: BROWSER_HEADERS,
+      headers: BROWSER_HEADERS,   // ✅ 여기 BROWSER_HEADERS도 Cookie가 CONSENT=YES+1; SOCS=CAI; 로 되어 있어야 함
+      redirect: "follow",
       cache: "no-store",
     });
 
