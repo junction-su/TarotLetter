@@ -213,6 +213,12 @@ async function fetchWatchPage(videoId: string): Promise<WatchPageResult> {
     if (!res.ok) continue;
 
     const html = await res.text();
+    const blocked = detectBlockedPage(html);
+    if (blocked) {
+      console.log("BLOCKED HTML HEAD:", html.slice(0, 300));
+      return NextResponse.json({ title: null, channelName: null, description: null, reason: blocked });
+    }
+
 
     // Consent / cookie-wall detection
     const blocked = detectBlockedPage(html);
