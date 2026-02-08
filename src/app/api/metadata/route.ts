@@ -80,6 +80,12 @@ export async function GET(req: NextRequest) {
 
       const finalUrl = res.url ?? url;
       const html = await res.text();
+      console.log("[metadata] status", res.status, "finalUrl", res.url);
+      console.log("[metadata] head", html.slice(0, 200));
+      console.log("[metadata] hasYTIPR", html.includes("ytInitialPlayerResponse"));
+      console.log("[metadata] hasPlayerResp", html.includes("playerResponse"));
+      console.log("[metadata] hasConsent", html.includes("consent.youtube.com"));
+
 
       if (isConsent(html, finalUrl)) {
         if (hl === "ko") continue;
