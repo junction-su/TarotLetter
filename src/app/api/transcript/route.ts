@@ -23,22 +23,20 @@ function extractVideoId(input: string | null): string | null {
 }
 
 function looksLikeHtml(s: string): boolean {
-  const t = s.trimStart();
+  const t = s.trimStart().toLowerCase();
   return (
     t.startsWith("<!doctype html") ||
     t.startsWith("<html") ||
     t.includes("<title>") ||
     t.includes("consent.youtube.com") ||
     t.includes("verify you are a human") ||
-    t.includes("Sign in to YouTube")
+    t.includes("sign in to youtube")
   );
 }
 
-// watch HTML 안의 ytInitialPlayerResponse를 brace-matching으로 파싱
 function findBalancedJsonAfter(html: string, marker: string): any | null {
   const idx = html.indexOf(marker);
   if (idx < 0) return null;
-
   const start = html.indexOf("{", idx);
   if (start < 0) return null;
 
@@ -101,21 +99,22 @@ function pickCaptionTrack(player: any, langPref: string) {
   );
 }
 
-// JSON3에서 "utf8":"..."만 긁어서 텍스트로 복원
 function extractUtf8Strings(body: string): string {
   const out: string[] = [];
   const re = /"utf8"\s*:\s*"((?:\\.|[^"\\])*)"/g;
   let m: RegExpExecArray | null;
+
   while ((m = re.exec(body))) {
     const raw = m[1]
       .replace(/\\"/g, '"')
       .replace(/\\n/g, "\n")
       .replace(/\\t/g, "\t")
       .replace(/\\\\/g, "\\");
+
     const cleaned = raw.replace(/\s+/g, " ").trim();
     if (cleaned) out.push(cleaned);
   }
-  // 중복 줄이기
+
   const uniq: string[] = [];
   for (const s of out) {
     if (uniq.length === 0 || uniq[uniq.length - 1] !== s) uniq.push(s);
@@ -125,61 +124,106 @@ function extractUtf8Strings(body: string): string {
 
 function withFmtJson3(url: string) {
   const u = new URL(url);
-  // fmt 강제
   u.searchParams.set("fmt", "json3");
   return u.toString();
 }
 
-async function fetchText(url: string) {
-  // IMPORTANT: HEAD 금지. 무조건 GET.
+// watch 페이지용 (HTML)
+async function fetchHTML(url: string) {
   const res = await fetch(url, {
     method: "GET",
     redirect: "follow",
+    cache: "no-store",
     headers: {
-      // YouTube가 가끔 “봇”으로 보이면 HTML을 주기 때문에 브라우저스럽게
       "user-agent":
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "accept-language": "en-US,en;q=0.9,ko;q=0.8",
-      // timedtext는 보통 referer를 좋아함
-      referer: "https://www.youtube.com/",
     },
-    // Next/Node fetch 캐시 끄기
-    cache: "no-store",
   });
 
-  const text = await res.text();
+  const ab = await res.arrayBuffer();
+  const text = Buffer.from(ab).toString("utf8");
+
   return {
     status: res.status,
     contentType: res.headers.get("content-type") || "",
+    contentLength: res.headers.get("content-length"),
+    finalUrl: res.url,
+    redirected: res.redirected,
+    bytes: ab.byteLength,
+    text,
+  };
+}
+
+// timedtext용 (JSON/VTT 등) — HTML accept 절대 금지
+async function fetchANY(url: string, referer?: string) {
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    cache: "no-store",
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      accept: "*/*",
+      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
+      ...(referer ? { referer } : {}),
+    },
+  });
+
+  const ab = await res.arrayBuffer();
+  // NOTE: timedtext json3는 utf-8 텍스트라 그냥 utf8로 디코드
+  const text = Buffer.from(ab).toString("utf8");
+
+  return {
+    status: res.status,
+    contentType: res.headers.get("content-type") || "",
+    contentLength: res.headers.get("content-length"),
+    finalUrl: res.url,
+    redirected: res.redirected,
+    bytes: ab.byteLength,
     text,
   };
 }
 
 export async function GET(req: NextRequest) {
-  const url = new URL(req.url);
-  const vid = extractVideoId(url.searchParams.get("v"));
-  const tlang = url.searchParams.get("tlang") || "ko";
-  const debugOn = url.searchParams.get("debug") === "1";
+  const u = new URL(req.url);
+  const vid = extractVideoId(u.searchParams.get("v"));
+  const tlang = u.searchParams.get("tlang") || "ko";
+  const debugOn = u.searchParams.get("debug") === "1";
 
   const debug: any = { step: null };
 
   if (!vid) {
-    const out: ApiOut = { transcript: null, reason: "MISSING_VIDEO_ID" };
-    return NextResponse.json(out, { status: 400 });
+    return NextResponse.json(
+      { transcript: null, reason: "MISSING_VIDEO_ID" } satisfies ApiOut,
+      { status: 400 }
+    );
   }
 
   // 1) watch 페이지에서 playerResponse 파싱
   debug.step = "fetch_watch";
   const watchUrl = `https://www.youtube.com/watch?v=${vid}`;
-  const watch = await fetchText(watchUrl);
+  const watch = await fetchHTML(watchUrl);
 
-  debug.watch = debugOn
-    ? { status: watch.status, contentType: watch.contentType, bytes: watch.text.length }
-    : undefined;
+  if (debugOn) {
+    debug.watch = {
+      status: watch.status,
+      contentType: watch.contentType,
+      contentLength: watch.contentLength,
+      redirected: watch.redirected,
+      finalUrl: watch.finalUrl,
+      bytes: watch.bytes,
+    };
+  }
 
   if (watch.status !== 200 || !watch.text) {
-    const out: ApiOut = { transcript: null, reason: "WATCH_FETCH_FAILED", error: `status=${watch.status}` };
+    const out: ApiOut = {
+      transcript: null,
+      reason: "WATCH_FETCH_FAILED",
+      error: `status=${watch.status}`,
+    };
     if (debugOn) out.debug = debug;
     return NextResponse.json(out);
   }
@@ -204,7 +248,9 @@ export async function GET(req: NextRequest) {
           languageCode: chosenTrack.languageCode,
           vssId: chosenTrack.vssId,
           name: chosenTrack.name,
+          baseUrlLen: String(chosenTrack.baseUrl || "").length,
           baseUrlHead: String(chosenTrack.baseUrl || "").slice(0, 180),
+          baseUrlTail: String(chosenTrack.baseUrl || "").slice(-180),
         }
       : null;
   }
@@ -220,34 +266,60 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(out);
   }
 
-  // 2) baseUrl에 fmt=json3 강제해서 GET
+  // 2) timedtext json3 강제 + GET only
   debug.step = "fetch_timedtext_json3";
   const ttUrl = withFmtJson3(chosenTrack.baseUrl);
-  const timed = await fetchText(ttUrl);
+
+  // referer를 watch로 걸어줌 (유튜브가 이거 좋아함)
+  const timed = await fetchANY(ttUrl, watchUrl);
 
   if (debugOn) {
     debug.timedtext = {
-      url: ttUrl.slice(0, 240),
       status: timed.status,
       contentType: timed.contentType,
-      bytes: timed.text.length,
+      contentLength: timed.contentLength,
+      redirected: timed.redirected,
+      finalUrl: timed.finalUrl,
+      bytes: timed.bytes,
+      // URL은 너무 길어서 head/tail만
+      urlHead: ttUrl.slice(0, 220),
+      urlTail: ttUrl.slice(-220),
       head: timed.text.slice(0, 120),
     };
   }
 
-  // HTML이면 YouTube가 자막을 안 주고 있는 것
-  if (timed.status !== 200 || !timed.text || looksLikeHtml(timed.text)) {
+  // 여기서 “진짜로 왜 실패인지”를 명확히 나눔
+  if (timed.status !== 200) {
     const out: ApiOut = {
       transcript: null,
       reason: "CAPTION_FETCH_FAILED",
       description,
       strategy: "timedtext_json3",
-      error:
-        timed.status !== 200
-          ? `status=${timed.status}`
-          : looksLikeHtml(timed.text)
-          ? "timedtext returned HTML (blocked/consent)"
-          : "empty timedtext body",
+      error: `status=${timed.status}`,
+    };
+    if (debugOn) out.debug = debug;
+    return NextResponse.json(out);
+  }
+
+  if (timed.bytes === 0) {
+    const out: ApiOut = {
+      transcript: null,
+      reason: "CAPTION_FETCH_FAILED",
+      description,
+      strategy: "timedtext_json3",
+      error: "timedtext body is 0 bytes (blocked/expired/consent)",
+    };
+    if (debugOn) out.debug = debug;
+    return NextResponse.json(out);
+  }
+
+  if (looksLikeHtml(timed.text)) {
+    const out: ApiOut = {
+      transcript: null,
+      reason: "CAPTION_FETCH_FAILED",
+      description,
+      strategy: "timedtext_json3",
+      error: "timedtext returned HTML (consent/bot-check/sign-in)",
     };
     if (debugOn) out.debug = debug;
     return NextResponse.json(out);
