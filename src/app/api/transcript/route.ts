@@ -28,20 +28,22 @@ type TranscriptResult =
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+const CONSENT_COOKIE = "CONSENT=YES+1; SOCS=CAI;";
+
 const WATCH_HEADERS: Record<string, string> = {
   "User-Agent": UA,
   "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
   Accept:
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
   Referer: "https://www.youtube.com/",
-  Cookie: "CONSENT=YES+1; SOCS=CAI;",
+  Cookie: CONSENT_COOKIE,
 };
 
 const CAPTION_HEADERS: Record<string, string> = {
   "User-Agent": UA,
   Accept: "*/*",
   Referer: "https://www.youtube.com/",
-  Cookie: "CONSENT=YES+1; SOCS=CAI;",
+  Cookie: CONSENT_COOKIE,
 };
 
 function ok(transcript: string, description: string | null, strategy: TranscriptStrategy) {
@@ -68,13 +70,13 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Invalid video ID" }, { status: 400 });
   }
 
-  // 원하면 /api/transcript?v=...&tlang=ko 로 “자동번역 자막”도 가능
+  // /api/transcript?v=...&tlang=ko 로 자동번역 자막도 시도 가능
   const tlang = req.nextUrl.searchParams.get("tlang") || undefined;
 
   let description: string | null = null;
 
   try {
-    // 1) watch 페이지에서 playerResponse + ytcfg(키/버전) 뽑기
+    // 1) watch HTML에서 pr + ytcfg 수집
     const page = await fetchWatchPage(videoId);
     if (page.blocked) return fail(page.blocked, description);
 
@@ -85,14 +87,13 @@ export async function GET(req: NextRequest) {
 
       const tracks1 = extractCaptionTracks(pr1);
       if (tracks1.length) {
-        const text = await fetchCaptionFromTracks(tracks1, tlang);
-        if (text) return ok(text, description, "caption_tracks");
+        const text1 = await fetchCaptionFromTracks(tracks1, tlang);
+        if (text1) return ok(text1, description, "caption_tracks");
       }
     }
 
-    // 2) watch HTML에 captionTracks가 없으면: youtubei player API로 재시도
+    // 2) captions가 watch HTML에 없으면 youtubei/v1/player로 재호출
     if (!page.ytApiKey || !page.clientName || !page.clientVersion) {
-      // youtubei 호출에 필요한 값이 없으면 여기서 끝
       return fail(pr1 ? "NO_CAPTIONS" : "PLAYER_RESPONSE_NOT_FOUND", description);
     }
 
@@ -101,14 +102,15 @@ export async function GET(req: NextRequest) {
       apiKey: page.ytApiKey,
       clientName: page.clientName,
       clientVersion: page.clientVersion,
+      visitorData: page.visitorData,
+      signatureTimestamp: page.signatureTimestamp,
       hl: page.hlUsed ?? "en",
+      gl: "US",
     });
 
     if (!pr2) return fail("PLAYER_RESPONSE_NOT_FOUND", description);
 
-    // description은 여기서도 한 번 더 보정 가능
     description = description ?? extractDescription(pr2);
-
     if (isAgeGate(pr2)) return fail("AGE_RESTRICTED", description);
 
     const tracks2 = extractCaptionTracks(pr2);
@@ -123,13 +125,15 @@ export async function GET(req: NextRequest) {
   }
 }
 
-/** watch 페이지 가져오기 + ytInitialPlayerResponse + ytcfg 키/버전 추출 */
+/** watch 페이지에서 ytInitialPlayerResponse + ytcfg(INNERTUBE_*, VISITOR_DATA, STS) 추출 */
 async function fetchWatchPage(videoId: string): Promise<{
   playerResponse: any | null;
   blocked: TranscriptFailReason | null;
   ytApiKey: string | null;
   clientName: string | null;
   clientVersion: string | null;
+  visitorData: string | null;
+  signatureTimestamp: number | null;
   hlUsed: string | null;
 }> {
   for (const hl of ["ko", "en"]) {
@@ -154,6 +158,8 @@ async function fetchWatchPage(videoId: string): Promise<{
         ytApiKey: null,
         clientName: null,
         clientVersion: null,
+        visitorData: null,
+        signatureTimestamp: null,
         hlUsed: hl,
       };
     }
@@ -164,6 +170,8 @@ async function fetchWatchPage(videoId: string): Promise<{
         ytApiKey: null,
         clientName: null,
         clientVersion: null,
+        visitorData: null,
+        signatureTimestamp: null,
         hlUsed: hl,
       };
     }
@@ -171,11 +179,15 @@ async function fetchWatchPage(videoId: string): Promise<{
     const pr = extractInitialPlayerResponse(html);
 
     const ytApiKey = extractYtcfgValue(html, "INNERTUBE_API_KEY");
-    const clientName =
-      extractYtcfgValue(html, "INNERTUBE_CONTEXT_CLIENT_NAME") ||
-      "WEB"; // 안전 기본값
-    const clientVersion =
-      extractYtcfgValue(html, "INNERTUBE_CONTEXT_CLIENT_VERSION");
+    const clientNameRaw = extractYtcfgValue(html, "INNERTUBE_CONTEXT_CLIENT_NAME");
+    const clientVersion = extractYtcfgValue(html, "INNERTUBE_CONTEXT_CLIENT_VERSION");
+    const visitorData = extractYtcfgValue(html, "VISITOR_DATA");
+    const stsStr = extractYtcfgValue(html, "STS");
+
+    const clientName = normalizeClientName(clientNameRaw);
+
+    const signatureTimestamp =
+      stsStr && /^\d+$/.test(stsStr) ? Number(stsStr) : null;
 
     return {
       playerResponse: pr,
@@ -183,6 +195,8 @@ async function fetchWatchPage(videoId: string): Promise<{
       ytApiKey,
       clientName,
       clientVersion,
+      visitorData,
+      signatureTimestamp,
       hlUsed: hl,
     };
   }
@@ -193,6 +207,8 @@ async function fetchWatchPage(videoId: string): Promise<{
     ytApiKey: null,
     clientName: null,
     clientVersion: null,
+    visitorData: null,
+    signatureTimestamp: null,
     hlUsed: null,
   };
 }
@@ -222,24 +238,18 @@ function extractDescription(pr: any): string | null {
 
 function isAgeGate(pr: any) {
   const ps = pr?.playabilityStatus as { status?: string; reason?: string } | undefined;
-  return (
-    ps?.status === "LOGIN_REQUIRED" ||
-    (ps?.reason && /age/i.test(ps.reason))
-  );
+  return ps?.status === "LOGIN_REQUIRED" || !!(ps?.reason && /age/i.test(ps.reason));
 }
 
-function extractCaptionTracks(pr: any): Array<{ baseUrl: string; kind?: string; languageCode?: string }> {
-  const tracks =
-    pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+function extractCaptionTracks(pr: any): Array<{ baseUrl: string; kind?: string }> {
+  const tracks = pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
   return Array.isArray(tracks) ? tracks : [];
 }
 
-/** captionTracks에서 자막 다운로드 (baseUrl은 서명 파라미터 포함 → 0바이트 문제 해결) */
 async function fetchCaptionFromTracks(
-  tracks: Array<{ baseUrl: string; kind?: string; languageCode?: string }>,
+  tracks: Array<{ baseUrl: string; kind?: string }>,
   tlang?: string,
 ): Promise<string | null> {
-  // 수동 > 자동(asr) 우선
   const manual = tracks.find((t) => t.kind !== "asr");
   const track = manual ?? tracks[0];
   if (!track?.baseUrl) return null;
@@ -254,7 +264,6 @@ async function fetchCaptionFromTracks(
     redirect: "follow",
     cache: "no-store",
   });
-
   if (!res.ok) return null;
 
   const xmlText = await res.text();
@@ -266,65 +275,101 @@ async function fetchCaptionFromTracks(
   return segments.join("\n");
 }
 
-/** youtubei player API 호출 */
+/** 핵심: youtubei/v1/player 호출을 “웹 클라이언트처럼” */
 async function fetchYoutubeiPlayer(opts: {
   videoId: string;
   apiKey: string;
   clientName: string;
   clientVersion: string;
+  visitorData: string | null;
+  signatureTimestamp: number | null;
   hl: string;
+  gl: string;
 }): Promise<any | null> {
   const endpoint = `https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(
     opts.apiKey,
   )}`;
 
-  const body = {
+  const body: any = {
     videoId: opts.videoId,
     context: {
       client: {
-        clientName: normalizeClientName(opts.clientName),
+        clientName: opts.clientName,
         clientVersion: opts.clientVersion,
         hl: opts.hl,
-        gl: "US",
+        gl: opts.gl,
+        visitorData: opts.visitorData ?? undefined,
       },
     },
+    // 이 두 개가 없으면 일부 응답이 줄어드는 경우가 있음
+    contentCheckOk: true,
+    racyCheckOk: true,
   };
+
+  if (opts.signatureTimestamp) {
+    body.playbackContext = {
+      contentPlaybackContext: {
+        signatureTimestamp: opts.signatureTimestamp,
+      },
+    };
+  }
+
+  const headers: Record<string, string> = {
+    "User-Agent": UA,
+    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+    "Content-Type": "application/json",
+    Origin: "https://www.youtube.com",
+    Referer: "https://www.youtube.com/",
+    Cookie: CONSENT_COOKIE,
+    // ✅ 중요: 유튜브가 “내가 어떤 클라이언트냐” 판단할 때 헤더도 봄
+    "X-Youtube-Client-Name": clientNameToHeader(opts.clientName),
+    "X-Youtube-Client-Version": opts.clientVersion,
+  };
+
+  if (opts.visitorData) {
+    headers["X-Goog-Visitor-Id"] = opts.visitorData;
+  }
 
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      "User-Agent": UA,
-      "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
-      "Content-Type": "application/json",
-      Origin: "https://www.youtube.com",
-      Referer: "https://www.youtube.com/",
-      Cookie: "CONSENT=YES+1; SOCS=CAI;",
-    },
+    headers,
     body: JSON.stringify(body),
     redirect: "follow",
     cache: "no-store",
   });
 
   if (!res.ok) return null;
+
   return await res.json();
 }
 
-// ytcfg에선 숫자로 들어오는 경우도 있어서 WEB으로 normalize
-function normalizeClientName(v: string) {
-  // "1" 같은 숫자면 WEB으로
-  if (/^\d+$/.test(v)) return "WEB";
+function normalizeClientName(v: string | null): string | null {
+  if (!v) return null;
+  if (/^\d+$/.test(v)) return "WEB"; // 숫자로 오면 WEB로
   return v;
 }
 
-/** ytcfg.set({...}) 안에서 key 값 추출 (대충이라도 안정적으로) */
+// X-Youtube-Client-Name 헤더는 보통 숫자값을 기대함 (WEB=1)
+function clientNameToHeader(name: string) {
+  // 가장 흔한 케이스만 처리
+  if (name === "WEB") return "1";
+  // 다른 값이면 그냥 WEB로 취급
+  return "1";
+}
+
+/** ytcfg 안에서 key 값 추출 (단순하지만 실용적으로) */
 function extractYtcfgValue(html: string, key: string): string | null {
-  // 1) "KEY":"VALUE"
+  // "KEY":"VALUE"
   const m1 = html.match(new RegExp(`${key}"\\s*:\\s*"([^"]+)"`));
   if (m1?.[1]) return m1[1];
 
-  // 2) KEY: "VALUE"
+  // KEY: "VALUE"
   const m2 = html.match(new RegExp(`${key}\\s*:\\s*"([^"]+)"`));
   if (m2?.[1]) return m2[1];
+
+  // KEY: 12345 (숫자)
+  const m3 = html.match(new RegExp(`${key}"?\\s*:\\s*(\\d+)`));
+  if (m3?.[1]) return m3[1];
 
   return null;
 }
@@ -404,7 +449,7 @@ function withQuery(baseUrl: string, params: Record<string, string>) {
   return u.toString();
 }
 
-// ===== ASR fallback (optional) =====
+// ===== optional ASR =====
 async function tryAsr(videoId: string): Promise<string | null> {
   const endpoint = process.env.ASR_ENDPOINT;
   if (!endpoint) return null;
