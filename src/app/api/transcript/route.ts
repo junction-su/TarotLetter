@@ -1,541 +1,152 @@
 import { NextRequest, NextResponse } from "next/server";
-export const runtime = "nodejs";
-
-type TranscriptFailReason =
-  | "CONSENT_PAGE"
-  | "AGE_RESTRICTED"
-  | "PLAYER_RESPONSE_NOT_FOUND"
-  | "NO_CAPTIONS"
-  | "CAPTION_FETCH_FAILED"
-  | "ASR_NOT_CONFIGURED";
-
-type TranscriptStrategy = "caption_tracks" | "youtubei_player" | "asr" | null;
-
-type TranscriptResult =
-  | {
-      transcript: string;
-      reason: null;
-      description: string | null;
-      strategy: TranscriptStrategy;
-    }
-  | {
-      transcript: null;
-      reason: TranscriptFailReason;
-      description: string | null;
-      strategy: null;
-    };
 
 const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
-const CONSENT_COOKIE = "CONSENT=YES+1; SOCS=CAI;";
-
-const WATCH_HEADERS: Record<string, string> = {
-  "User-Agent": UA,
-  "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  Referer: "https://www.youtube.com/",
-  Cookie: CONSENT_COOKIE,
-};
-
-const CAPTION_HEADERS: Record<string, string> = {
-  "User-Agent": UA,
-  Accept: "*/*",
-  Referer: "https://www.youtube.com/",
-  Cookie: CONSENT_COOKIE,
-};
-
-function ok(transcript: string, description: string | null, strategy: TranscriptStrategy) {
-  return NextResponse.json<TranscriptResult>({
-    transcript,
-    reason: null,
-    description,
-    strategy,
-  });
-}
-
-function fail(reason: TranscriptFailReason, description: string | null) {
-  return NextResponse.json<TranscriptResult>({
-    transcript: null,
-    reason,
-    description,
-    strategy: null,
-  });
-}
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
 export async function GET(req: NextRequest) {
-  const videoId = req.nextUrl.searchParams.get("v");
-  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
-    return NextResponse.json({ error: "Invalid video ID" }, { status: 400 });
+  const { searchParams } = new URL(req.url);
+  const videoId = searchParams.get("v");
+
+  if (!videoId) {
+    return NextResponse.json({ transcript: null, reason: "NO_VIDEO_ID" });
   }
 
-  // /api/transcript?v=...&tlang=ko 로 자동번역 자막도 시도 가능
-  const tlang = req.nextUrl.searchParams.get("tlang") || undefined;
-
-  let description: string | null = null;
-
   try {
-    // 1) watch HTML에서 pr + ytcfg 수집
-    const page = await fetchWatchPage(videoId);
-    if (page.blocked) return fail(page.blocked, description);
+    const transcript =
+      (await tryJson3Asr(videoId)) ||
+      (await tryTimedtextXml(videoId));
 
-    const pr1 = page.playerResponse;
-    if (pr1) {
-      description = extractDescription(pr1);
-      if (isAgeGate(pr1)) return fail("AGE_RESTRICTED", description);
-
-      const tracks1 = extractCaptionTracks(pr1);
-      if (tracks1.length) {
-        const text1 = await fetchCaptionFromTracks(tracks1, tlang);
-        if (text1) return ok(text1, description, "caption_tracks");
-      }
+    if (!transcript) {
+      return NextResponse.json({
+        transcript: null,
+        reason: "NO_CAPTIONS",
+      });
     }
 
-    // 2) captions가 watch HTML에 없으면 youtubei/v1/player로 재호출
-    if (!page.ytApiKey || !page.clientName || !page.clientVersion) {
-      return fail(pr1 ? "NO_CAPTIONS" : "PLAYER_RESPONSE_NOT_FOUND", description);
-    }
-
-    const pr2 = await fetchYoutubeiPlayer({
-      videoId,
-      apiKey: page.ytApiKey,
-      clientName: page.clientName,
-      clientVersion: page.clientVersion,
-      visitorData: page.visitorData,
-      signatureTimestamp: page.signatureTimestamp,
-      hl: page.hlUsed ?? "en",
-      gl: "US",
+    return NextResponse.json({
+      transcript,
+      reason: null,
     });
-
-    if (!pr2) return fail("PLAYER_RESPONSE_NOT_FOUND", description);
-
-    description = description ?? extractDescription(pr2);
-    if (isAgeGate(pr2)) return fail("AGE_RESTRICTED", description);
-
-    const tracks2 = extractCaptionTracks(pr2);
-    if (!tracks2.length) return fail("NO_CAPTIONS", description);
-
-    const text2 = await fetchCaptionFromTracks(tracks2, tlang);
-    if (text2) return ok(text2, description, "youtubei_player");
-
-    return fail("CAPTION_FETCH_FAILED", description);
-  } catch {
-    return fail("CAPTION_FETCH_FAILED", description);
+  } catch (e: any) {
+    return NextResponse.json({
+      transcript: null,
+      reason: "CAPTION_FETCH_FAILED",
+      error: e.message,
+    });
   }
 }
 
-/** watch 페이지에서 ytInitialPlayerResponse + ytcfg(INNERTUBE_*, VISITOR_DATA, STS) 추출 */
-async function fetchWatchPage(videoId: string): Promise<{
-  playerResponse: any | null;
-  blocked: TranscriptFailReason | null;
-  ytApiKey: string | null;
-  clientName: string | null;
-  clientVersion: string | null;
-  visitorData: string | null;
-  signatureTimestamp: number | null;
-  hlUsed: string | null;
-}> {
-  for (const hl of ["ko", "en"]) {
-    const url =
-      `https://www.youtube.com/watch?v=${videoId}` +
-      `&hl=${hl}&gl=US&persist_hl=1&persist_gl=1&bpctr=9999999999&has_verified=1`;
+/* ------------------------------------------------ */
+/* 1️⃣ JSON3 (자동 생성 자막) 시도 */
+/* ------------------------------------------------ */
+
+async function tryJson3Asr(videoId: string): Promise<string | null> {
+  const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=ko&kind=asr&fmt=json3`;
+
+  const res = await fetch(url, {
+    headers: { "User-Agent": UA },
+    redirect: "follow",
+    cache: "no-store",
+  });
+
+  if (!res.ok) return null;
+
+  const json = await res.json();
+
+  if (!json.events) return null;
+
+  const lines: string[] = [];
+
+  for (const e of json.events) {
+    if (!e.segs) continue;
+
+    const text = e.segs.map((s: any) => s.utf8).join("");
+    if (text.trim()) lines.push(text.trim());
+  }
+
+  return cleanTranscript(lines.join(" "));
+}
+
+/* ------------------------------------------------ */
+/* 2️⃣ XML fallback (수동 자막 대비) */
+/* ------------------------------------------------ */
+
+async function tryTimedtextXml(videoId: string): Promise<string | null> {
+  const langs = ["ko", "en"];
+
+  for (const lang of langs) {
+    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`;
 
     const res = await fetch(url, {
-      headers: WATCH_HEADERS,
+      headers: { "User-Agent": UA },
       redirect: "follow",
       cache: "no-store",
     });
+
     if (!res.ok) continue;
 
-    const html = await res.text();
+    const xmlText = await res.text();
+    if (!xmlText) continue;
 
-    if (isConsentPage(html)) {
-      if (hl === "ko") continue;
-      return {
-        playerResponse: null,
-        blocked: "CONSENT_PAGE",
-        ytApiKey: null,
-        clientName: null,
-        clientVersion: null,
-        visitorData: null,
-        signatureTimestamp: null,
-        hlUsed: hl,
-      };
+    const segments = parseCaptionXml(xmlText);
+
+    if (segments.length > 0) {
+      return cleanTranscript(segments.join(" "));
     }
-    if (isAgeRestrictedHtml(html)) {
-      return {
-        playerResponse: null,
-        blocked: "AGE_RESTRICTED",
-        ytApiKey: null,
-        clientName: null,
-        clientVersion: null,
-        visitorData: null,
-        signatureTimestamp: null,
-        hlUsed: hl,
-      };
-    }
-
-    const pr = extractInitialPlayerResponse(html);
-
-    const ytApiKey = extractYtcfgValue(html, "INNERTUBE_API_KEY");
-    const clientNameRaw = extractYtcfgValue(html, "INNERTUBE_CONTEXT_CLIENT_NAME");
-    const clientVersion = extractYtcfgValue(html, "INNERTUBE_CONTEXT_CLIENT_VERSION");
-    const visitorData = extractYtcfgValue(html, "VISITOR_DATA");
-    const stsStr = extractYtcfgValue(html, "STS");
-
-    const clientName = normalizeClientName(clientNameRaw);
-
-    const signatureTimestamp =
-      stsStr && /^\d+$/.test(stsStr) ? Number(stsStr) : null;
-
-    return {
-      playerResponse: pr,
-      blocked: null,
-      ytApiKey,
-      clientName,
-      clientVersion,
-      visitorData,
-      signatureTimestamp,
-      hlUsed: hl,
-    };
   }
 
-  return {
-    playerResponse: null,
-    blocked: null,
-    ytApiKey: null,
-    clientName: null,
-    clientVersion: null,
-    visitorData: null,
-    signatureTimestamp: null,
-    hlUsed: null,
-  };
+  return null;
 }
 
-function isConsentPage(html: string) {
-  const hasConsent =
-    html.includes("consent.youtube.com") ||
-    html.includes('action="https://consent.google.com') ||
-    html.includes("CONSENT_PENDING") ||
-    html.includes("accounts.google.com/ServiceLogin");
-  const hasPlayer = html.includes("ytInitialPlayerResponse");
-  return hasConsent && !hasPlayer;
-}
+/* ------------------------------------------------ */
+/* XML 파싱 */
+/* ------------------------------------------------ */
 
-function isAgeRestrictedHtml(html: string) {
-  return (
-    html.includes("og:restrictions:age") ||
-    html.includes('"reason":"Sign in to confirm your age"') ||
-    html.includes("playerLegacyDesktopYpcOfferRenderer")
+function parseCaptionXml(xml: string): string[] {
+  const matches = [...xml.matchAll(/<text[^>]*>(.*?)<\/text>/g)];
+  return matches.map((m) =>
+    decodeHtml(m[1])
+      .replace(/\s+/g, " ")
+      .trim()
   );
 }
 
-function extractDescription(pr: any): string | null {
-  const vd = pr?.videoDetails as { shortDescription?: string } | undefined;
-  return vd?.shortDescription ?? null;
-}
-
-function isAgeGate(pr: any) {
-  const ps = pr?.playabilityStatus as { status?: string; reason?: string } | undefined;
-  return ps?.status === "LOGIN_REQUIRED" || !!(ps?.reason && /age/i.test(ps.reason));
-}
-
-function extractCaptionTracks(pr: any): Array<{ baseUrl: string; kind?: string }> {
-  const tracks = pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
-  return Array.isArray(tracks) ? tracks : [];
-}
-
-async function fetchCaptionFromTracks(
-  tracks: Array<{ baseUrl: string; kind?: string }>,
-  tlang?: string,
-): Promise<string | null> {
-  const manual = tracks.find((t) => t.kind !== "asr");
-  const track = manual ?? tracks[0];
-  if (!track?.baseUrl) return null;
-
-  // ✅ fmt는 json3로 먼저 시도 (제일 안정적)
-  const urlJson3 = withQuery(track.baseUrl, {
-    fmt: "json3",
-    ...(tlang ? { tlang } : {}),
-  });
-
-  let res = await fetch(urlJson3, {
-    headers: CAPTION_HEADERS,
-    redirect: "follow",
-    cache: "no-store",
-  });
-
-  const ct1 = res.headers.get("content-type") || "";
-  const body1 = await res.text();
-
-  console.log("[caption] status", res.status);
-  console.log("[caption] content-type", ct1);
-  console.log("[caption] url(head)", urlJson3.slice(0, 140));
-  console.log("[caption] bytes", body1.length);
-  console.log("[caption] head", body1.slice(0, 200));
-
-  if (res.ok && body1.length > 20) {
-    const text = parseCaptionAny(body1);
-    if (text) return text;
-  }
-
-  // ✅ json3가 막혔거나 비면 srv3(XML)도 한 번 더
-  const urlSrv3 = withQuery(track.baseUrl, {
-    fmt: "srv3",
-    ...(tlang ? { tlang } : {}),
-  });
-
-  res = await fetch(urlSrv3, {
-    headers: CAPTION_HEADERS,
-    redirect: "follow",
-    cache: "no-store",
-  });
-
-  const ct2 = res.headers.get("content-type") || "";
-  const body2 = await res.text();
-
-  console.log("[caption2] status", res.status);
-  console.log("[caption2] content-type", ct2);
-  console.log("[caption2] url(head)", urlSrv3.slice(0, 140));
-  console.log("[caption2] bytes", body2.length);
-  console.log("[caption2] head", body2.slice(0, 200));
-
-  if (!res.ok || body2.length < 20) return null;
-
-  const text2 = parseCaptionAny(body2);
-  return text2;
-}
-
-/** ✅ XML(<text>)든 JSON3든 둘 다 처리 */
-function parseCaptionAny(payload: string): string | null {
-  const s = payload.trim();
-
-  // XML
-  if (s.includes("<text") && s.includes("</text>")) {
-    const segs = parseCaptionXml(s);
-    return segs.length ? segs.join("\n") : null;
-  }
-
-  // JSON3
-  if (s.startsWith("{")) {
-    const segs = parseCaptionJson3(s);
-    return segs.length ? segs.join("\n") : null;
-  }
-
-  // HTML(차단/동의/리디렉트 등)
-  if (s.startsWith("<!DOCTYPE") || s.startsWith("<html")) return null;
-
-  return null;
-}
-
-function parseCaptionJson3(jsonText: string): string[] {
-  try {
-    const data = JSON.parse(jsonText) as any;
-    const events = Array.isArray(data?.events) ? data.events : [];
-    const out: string[] = [];
-
-    for (const ev of events) {
-      const segs = Array.isArray(ev?.segs) ? ev.segs : [];
-      const line = segs
-        .map((x: any) => (typeof x?.utf8 === "string" ? x.utf8 : ""))
-        .join("")
-        .replace(/\n/g, " ")
-        .trim();
-      if (line) out.push(line);
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-
-/** 핵심: youtubei/v1/player 호출을 “웹 클라이언트처럼” */
-async function fetchYoutubeiPlayer(opts: {
-  videoId: string;
-  apiKey: string;
-  clientName: string;
-  clientVersion: string;
-  visitorData: string | null;
-  signatureTimestamp: number | null;
-  hl: string;
-  gl: string;
-}): Promise<any | null> {
-  const endpoint = `https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(
-    opts.apiKey,
-  )}`;
-
-  const body: any = {
-    videoId: opts.videoId,
-    context: {
-      client: {
-        clientName: opts.clientName,
-        clientVersion: opts.clientVersion,
-        hl: opts.hl,
-        gl: opts.gl,
-        visitorData: opts.visitorData ?? undefined,
-      },
-    },
-    // 이 두 개가 없으면 일부 응답이 줄어드는 경우가 있음
-    contentCheckOk: true,
-    racyCheckOk: true,
-  };
-
-  if (opts.signatureTimestamp) {
-    body.playbackContext = {
-      contentPlaybackContext: {
-        signatureTimestamp: opts.signatureTimestamp,
-      },
-    };
-  }
-
-  const headers: Record<string, string> = {
-    "User-Agent": UA,
-    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
-    "Content-Type": "application/json",
-    Origin: "https://www.youtube.com",
-    Referer: "https://www.youtube.com/",
-    Cookie: CONSENT_COOKIE,
-    // ✅ 중요: 유튜브가 “내가 어떤 클라이언트냐” 판단할 때 헤더도 봄
-    "X-Youtube-Client-Name": clientNameToHeader(opts.clientName),
-    "X-Youtube-Client-Version": opts.clientVersion,
-  };
-
-  if (opts.visitorData) {
-    headers["X-Goog-Visitor-Id"] = opts.visitorData;
-  }
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    redirect: "follow",
-    cache: "no-store",
-  });
-
-  if (!res.ok) return null;
-
-  return await res.json();
-}
-
-function normalizeClientName(v: string | null): string | null {
-  if (!v) return null;
-  if (/^\d+$/.test(v)) return "WEB"; // 숫자로 오면 WEB로
-  return v;
-}
-
-// X-Youtube-Client-Name 헤더는 보통 숫자값을 기대함 (WEB=1)
-function clientNameToHeader(name: string) {
-  // 가장 흔한 케이스만 처리
-  if (name === "WEB") return "1";
-  // 다른 값이면 그냥 WEB로 취급
-  return "1";
-}
-
-/** ytcfg 안에서 key 값 추출 (단순하지만 실용적으로) */
-function extractYtcfgValue(html: string, key: string): string | null {
-  // "KEY":"VALUE"
-  const m1 = html.match(new RegExp(`${key}"\\s*:\\s*"([^"]+)"`));
-  if (m1?.[1]) return m1[1];
-
-  // KEY: "VALUE"
-  const m2 = html.match(new RegExp(`${key}\\s*:\\s*"([^"]+)"`));
-  if (m2?.[1]) return m2[1];
-
-  // KEY: 12345 (숫자)
-  const m3 = html.match(new RegExp(`${key}"?\\s*:\\s*(\\d+)`));
-  if (m3?.[1]) return m3[1];
-
-  return null;
-}
-
-// ===== ytInitialPlayerResponse 파싱 (brace 매칭) =====
-function extractInitialPlayerResponse(html: string): Record<string, unknown> | null {
-  const key = "ytInitialPlayerResponse";
-  const idx = html.indexOf(key);
-  if (idx === -1) return null;
-
-  const braceStart = html.indexOf("{", idx);
-  if (braceStart === -1) return null;
-
-  const jsonText = sliceBalancedBraces(html, braceStart);
-  if (!jsonText) return null;
-
-  try {
-    return JSON.parse(jsonText);
-  } catch {
-    return null;
-  }
-}
-
-function sliceBalancedBraces(s: string, start: number): string | null {
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-
-    if (ch === '"') {
-      inStr = true;
-      continue;
-    }
-
-    if (ch === "{") depth++;
-    else if (ch === "}") depth--;
-
-    if (depth === 0) return s.slice(start, i + 1);
-  }
-  return null;
-}
-
-// ===== caption xml parsing =====
-function parseCaptionXml(xml: string): string[] {
-  const segments: string[] = [];
-  const textRe = /<text[^>]*>([\s\S]*?)<\/text>/g;
-  let m: RegExpExecArray | null;
-
-  while ((m = textRe.exec(xml)) !== null) {
-    const decoded = decodeXmlEntities(m[1]).replace(/\n/g, " ").trim();
-    if (decoded) segments.push(decoded);
-  }
-  return segments;
-}
-
-function decodeXmlEntities(s: string): string {
-  return s
+function decodeHtml(str: string): string {
+  return str
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
 }
 
-function withQuery(baseUrl: string, params: Record<string, string>) {
-  const u = new URL(baseUrl);
-  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
-  return u.toString();
-}
+/* ------------------------------------------------ */
+/* 🧹 후처리 (ASR 정리) */
+/* ------------------------------------------------ */
 
-// ===== optional ASR =====
-async function tryAsr(videoId: string): Promise<string | null> {
-  const endpoint = process.env.ASR_ENDPOINT;
-  if (!endpoint) return null;
+function cleanTranscript(raw: string): string {
+  if (!raw) return raw;
 
-  const res = await fetch(`${endpoint}/transcribe`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ videoId }),
-  });
-  if (!res.ok) return null;
+  let text = raw;
 
-  const data: { transcript?: string } = await res.json();
-  return data.transcript ?? null;
+  // 1️⃣ 공백 정리
+  text = text.replace(/\s+/g, " ").trim();
+
+  // 2️⃣ 군더더기 단어 제거
+  text = text.replace(/\b(자|음|어|이제|그|뭐)\b[,\s]*/g, "");
+
+  // 3️⃣ 문장 단위 줄바꿈
+  text = text.replace(/([.!?]|다\.)\s+/g, "$1\n");
+
+  // 4️⃣ 중복 줄 제거
+  const lines = text.split("\n").map((l) => l.trim());
+  const deduped: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (i === 0 || lines[i] !== lines[i - 1]) {
+      deduped.push(lines[i]);
+    }
+  }
+
+  return deduped.join("\n").trim();
 }
