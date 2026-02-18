@@ -22,17 +22,23 @@ function extractVideoId(input: string | null): string | null {
   return null;
 }
 
-async function safeText(res: Response): Promise<string> {
-  try {
-    return await res.text();
-  } catch {
-    return "";
-  }
+function looksLikeHtml(s: string): boolean {
+  const t = s.trimStart();
+  return (
+    t.startsWith("<!doctype html") ||
+    t.startsWith("<html") ||
+    t.includes("<title>") ||
+    t.includes("consent.youtube.com") ||
+    t.includes("verify you are a human") ||
+    t.includes("Sign in to YouTube")
+  );
 }
 
+// watch HTML 안의 ytInitialPlayerResponse를 brace-matching으로 파싱
 function findBalancedJsonAfter(html: string, marker: string): any | null {
   const idx = html.indexOf(marker);
   if (idx < 0) return null;
+
   const start = html.indexOf("{", idx);
   if (start < 0) return null;
 
@@ -52,7 +58,10 @@ function findBalancedJsonAfter(html: string, marker: string): any | null {
         escape = true;
         continue;
       }
-      if (ch === '"') inString = false;
+      if (ch === '"') {
+        inString = false;
+        continue;
+      }
       continue;
     }
 
@@ -62,6 +71,7 @@ function findBalancedJsonAfter(html: string, marker: string): any | null {
     }
     if (ch === "{") depth++;
     if (ch === "}") depth--;
+
     if (depth === 0) {
       const jsonStr = html.slice(start, i + 1);
       try {
@@ -91,238 +101,180 @@ function pickCaptionTrack(player: any, langPref: string) {
   );
 }
 
-function looksLikeHtml(s: string): boolean {
-  const t = s.trimStart().toLowerCase();
-  return t.startsWith("<!doctype html") || t.startsWith("<html") || t.includes("consent.youtube.com");
-}
-
-function vttToPlainText(vtt: string): string {
-  const lines = vtt.split(/\r?\n/);
+// JSON3에서 "utf8":"..."만 긁어서 텍스트로 복원
+function extractUtf8Strings(body: string): string {
   const out: string[] = [];
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line === "WEBVTT") continue;
-    if (/^\d+$/.test(line)) continue;
-    if (line.includes("-->")) continue;
-    if (/^NOTE\b/i.test(line)) continue;
-
-    const cleaned = line
-      .replace(/<\/?c[^>]*>/g, "")
-      .replace(/<\/?i>/g, "")
-      .replace(/<\/?b>/g, "")
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .trim();
-
-    if (cleaned) out.push(cleaned);
-  }
-  return out.join(" ").replace(/\s+/g, " ").trim();
-}
-
-function xmlTimedtextToPlainText(xml: string): string {
-  const out: string[] = [];
-  const re = /<text[^>]*>([\s\S]*?)<\/text>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml))) {
-    const s = m[1]
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/<[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (s) out.push(s);
-  }
-  return out.join(" ").replace(/\s+/g, " ").trim();
-}
-
-function extractUtf8StringsFromJsonLikeText(body: string): string {
-  const results: string[] = [];
   const re = /"utf8"\s*:\s*"((?:\\.|[^"\\])*)"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(body))) {
-    try {
-      const decoded = JSON.parse(`"${m[1]}"`).trim();
-      if (decoded) results.push(decoded);
-    } catch {}
+    const raw = m[1]
+      .replace(/\\"/g, '"')
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\\\/g, "\\");
+    const cleaned = raw.replace(/\s+/g, " ").trim();
+    if (cleaned) out.push(cleaned);
   }
-  return results.join(" ").replace(/\s+/g, " ").trim();
+  // 중복 줄이기
+  const uniq: string[] = [];
+  for (const s of out) {
+    if (uniq.length === 0 || uniq[uniq.length - 1] !== s) uniq.push(s);
+  }
+  return uniq.join("\n").trim();
 }
 
-function normalizeTranscript(s: string): string {
-  return s.replace(/\s+/g, " ").trim();
+function withFmtJson3(url: string) {
+  const u = new URL(url);
+  // fmt 강제
+  u.searchParams.set("fmt", "json3");
+  return u.toString();
 }
 
-// ✅ 핵심: watch 응답의 Set-Cookie → "Cookie:" 헤더로 합치기
-function getCookieHeaderFromSetCookie(setCookies: string[]): string {
-  // "NAME=VALUE; Path=/; ..." → "NAME=VALUE"
-  const pairs = setCookies
-    .map((sc) => sc.split(";")[0].trim())
-    .filter(Boolean);
+async function fetchText(url: string) {
+  // IMPORTANT: HEAD 금지. 무조건 GET.
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      // YouTube가 가끔 “봇”으로 보이면 HTML을 주기 때문에 브라우저스럽게
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
+      // timedtext는 보통 referer를 좋아함
+      referer: "https://www.youtube.com/",
+    },
+    // Next/Node fetch 캐시 끄기
+    cache: "no-store",
+  });
 
-  // 중복 제거(뒤에 나온 값 우선)
-  const map = new Map<string, string>();
-  for (const p of pairs) {
-    const eq = p.indexOf("=");
-    if (eq > 0) {
-      map.set(p.slice(0, eq), p);
-    }
-  }
-  return Array.from(map.values()).join("; ");
+  const text = await res.text();
+  return {
+    status: res.status,
+    contentType: res.headers.get("content-type") || "",
+    text,
+  };
 }
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
-  const v = extractVideoId(url.searchParams.get("v"));
-  const tlang = (url.searchParams.get("tlang") || "ko").trim();
+  const vid = extractVideoId(url.searchParams.get("v"));
+  const tlang = url.searchParams.get("tlang") || "ko";
   const debugOn = url.searchParams.get("debug") === "1";
-  const debug: any = { step: "start", tlang };
 
-  if (!v) {
-    const out: ApiOut = { transcript: null, reason: "INVALID_VIDEO_ID", error: "Missing/invalid v parameter" };
+  const debug: any = { step: null };
+
+  if (!vid) {
+    const out: ApiOut = { transcript: null, reason: "MISSING_VIDEO_ID" };
     return NextResponse.json(out, { status: 400 });
   }
 
-  const watchUrl = `https://www.youtube.com/watch?v=${v}&hl=${encodeURIComponent(tlang)}&persist_gl=1&persist_hl=1`;
+  // 1) watch 페이지에서 playerResponse 파싱
   debug.step = "fetch_watch";
+  const watchUrl = `https://www.youtube.com/watch?v=${vid}`;
+  const watch = await fetchText(watchUrl);
 
-  const ua =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
-  const acceptLang = tlang === "en" ? "en-US,en;q=0.9" : "ko-KR,ko;q=0.9,en;q=0.6";
+  debug.watch = debugOn
+    ? { status: watch.status, contentType: watch.contentType, bytes: watch.text.length }
+    : undefined;
 
-  const watchRes = await fetch(watchUrl, {
-    method: "GET",
-    cache: "no-store",
-    headers: {
-      "User-Agent": ua,
-      "Accept-Language": acceptLang,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      // 리퍼러 의미는 없지만 watch 자체는 크게 상관 없음
-    },
-  });
-
-  const watchHtml = await safeText(watchRes);
-  debug.watch = { status: watchRes.status, bytes: watchHtml.length };
-
-  // ✅ Node fetch(undici)에서 set-cookie 여러 개 받기
-  const anyHeaders: any = watchRes.headers as any;
-  const setCookies: string[] =
-    typeof anyHeaders.getSetCookie === "function"
-      ? anyHeaders.getSetCookie()
-      : (watchRes.headers.get("set-cookie") ? [watchRes.headers.get("set-cookie") as string] : []);
-
-  const cookieHeader = setCookies.length ? getCookieHeaderFromSetCookie(setCookies) : "";
-  debug.cookies = { setCookieCount: setCookies.length, cookieHeaderBytes: cookieHeader.length };
-
-  if (!watchRes.ok || !watchHtml) {
-    const out: ApiOut = { transcript: null, reason: "WATCH_FETCH_FAILED", error: `watch status=${watchRes.status}` };
+  if (watch.status !== 200 || !watch.text) {
+    const out: ApiOut = { transcript: null, reason: "WATCH_FETCH_FAILED", error: `status=${watch.status}` };
     if (debugOn) out.debug = debug;
     return NextResponse.json(out);
   }
 
-  let player = findBalancedJsonAfter(watchHtml, "ytInitialPlayerResponse");
-  if (!player) player = findBalancedJsonAfter(watchHtml, "var ytInitialPlayerResponse");
+  const player =
+    findBalancedJsonAfter(watch.text, "var ytInitialPlayerResponse =") ||
+    findBalancedJsonAfter(watch.text, "ytInitialPlayerResponse =");
 
   if (!player) {
-    const out: ApiOut = { transcript: null, reason: "PLAYER_PARSE_FAILED", error: "Could not parse ytInitialPlayerResponse" };
-    if (debugOn) out.debug = { ...debug, htmlHead: watchHtml.slice(0, 500) };
+    const out: ApiOut = { transcript: null, reason: "PLAYER_PARSE_FAILED" };
+    if (debugOn) out.debug = debug;
     return NextResponse.json(out);
   }
 
   const description = extractDescription(player);
-  debug.step = "pick_track";
-
   const chosenTrack = pickCaptionTrack(player, tlang);
-  debug.chosenTrack = chosenTrack
-    ? {
-        name: chosenTrack?.name?.simpleText,
-        languageCode: chosenTrack?.languageCode,
-        vssId: chosenTrack?.vssId,
-        kind: chosenTrack?.kind,
-        baseUrlHead: typeof chosenTrack?.baseUrl === "string" ? chosenTrack.baseUrl.slice(0, 140) : null,
-      }
-    : null;
 
-  if (!chosenTrack?.baseUrl) {
-    const out: ApiOut = { transcript: null, reason: "NO_CAPTIONS", description, strategy: null };
-    if (debugOn) out.debug = debug;
-    return NextResponse.json(out);
+  debug.step = "pick_track";
+  if (debugOn) {
+    debug.chosenTrack = chosenTrack
+      ? {
+          languageCode: chosenTrack.languageCode,
+          vssId: chosenTrack.vssId,
+          name: chosenTrack.name,
+          baseUrlHead: String(chosenTrack.baseUrl || "").slice(0, 180),
+        }
+      : null;
   }
 
-  debug.step = "fetch_timedtext_raw";
-
-  const timedRes = await fetch(chosenTrack.baseUrl, {
-    method: "GET",
-    cache: "no-store",
-    headers: {
-      "User-Agent": ua,
-      "Accept-Language": acceptLang,
-      Accept: "*/*",
-      // ✅ 이 2개가 꽤 중요
-      Referer: watchUrl,
-      Origin: "https://www.youtube.com",
-      // ✅ watch에서 받은 쿠키 전달
-      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-    },
-  });
-
-  const timedBody = await safeText(timedRes);
-  const ctype = timedRes.headers.get("content-type") || "";
-  debug.timedtext = { status: timedRes.status, contentType: ctype, bytes: timedBody.length, head: timedBody.slice(0, 200) };
-
-  if (!timedRes.ok || !timedBody) {
+  if (!chosenTrack?.baseUrl) {
     const out: ApiOut = {
       transcript: null,
-      reason: "CAPTION_FETCH_FAILED",
+      reason: "NO_CAPTIONS",
       description,
-      strategy: "timedtext_raw",
-      error: `timedtext status=${timedRes.status}, bytes=${timedBody.length}, ct=${ctype}`,
+      strategy: null,
     };
     if (debugOn) out.debug = debug;
     return NextResponse.json(out);
   }
 
-  debug.step = "parse_timedtext";
+  // 2) baseUrl에 fmt=json3 강제해서 GET
+  debug.step = "fetch_timedtext_json3";
+  const ttUrl = withFmtJson3(chosenTrack.baseUrl);
+  const timed = await fetchText(ttUrl);
 
-  let transcript = "";
-  let strategy = "timedtext_raw";
-
-  if (ctype.includes("application/json") || timedBody.trimStart().startsWith("{")) {
-    transcript = extractUtf8StringsFromJsonLikeText(timedBody);
-    strategy = "timedtext_json_utf8_regex";
-  } else if (timedBody.includes("<transcript") || timedBody.includes("<text")) {
-    transcript = xmlTimedtextToPlainText(timedBody);
-    strategy = "timedtext_xml";
-  } else if (timedBody.startsWith("WEBVTT") || timedBody.includes("-->")) {
-    transcript = vttToPlainText(timedBody);
-    strategy = "timedtext_vtt";
-  } else if (looksLikeHtml(timedBody)) {
-    transcript = "";
-    strategy = "timedtext_html_blocked";
-  } else {
-    transcript = extractUtf8StringsFromJsonLikeText(timedBody);
-    strategy = "timedtext_fallback_utf8";
+  if (debugOn) {
+    debug.timedtext = {
+      url: ttUrl.slice(0, 240),
+      status: timed.status,
+      contentType: timed.contentType,
+      bytes: timed.text.length,
+      head: timed.text.slice(0, 120),
+    };
   }
 
-  transcript = normalizeTranscript(transcript);
+  // HTML이면 YouTube가 자막을 안 주고 있는 것
+  if (timed.status !== 200 || !timed.text || looksLikeHtml(timed.text)) {
+    const out: ApiOut = {
+      transcript: null,
+      reason: "CAPTION_FETCH_FAILED",
+      description,
+      strategy: "timedtext_json3",
+      error:
+        timed.status !== 200
+          ? `status=${timed.status}`
+          : looksLikeHtml(timed.text)
+          ? "timedtext returned HTML (blocked/consent)"
+          : "empty timedtext body",
+    };
+    if (debugOn) out.debug = debug;
+    return NextResponse.json(out);
+  }
+
+  // 3) JSON3 내용에서 utf8 텍스트 추출
+  debug.step = "extract_utf8";
+  const transcript = extractUtf8Strings(timed.text);
 
   if (!transcript) {
     const out: ApiOut = {
       transcript: null,
       reason: "CAPTION_PARSE_FAILED",
       description,
-      strategy,
-      error: "Timedtext fetched but could not extract transcript text",
+      strategy: "timedtext_json3",
+      error: "no utf8 strings found",
     };
-    if (debugOn) out.debug = { ...debug, strategy };
+    if (debugOn) out.debug = debug;
     return NextResponse.json(out);
   }
 
-  const out: ApiOut = { transcript, reason: null, description, strategy };
-  if (debugOn) out.debug = { ...debug, strategy };
+  const out: ApiOut = {
+    transcript,
+    reason: null,
+    description,
+    strategy: "timedtext_json3",
+  };
+  if (debugOn) out.debug = debug;
   return NextResponse.json(out);
 }
