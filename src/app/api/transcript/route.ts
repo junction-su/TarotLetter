@@ -29,7 +29,7 @@ interface TranscriptFailure {
 
 type TranscriptResult = TranscriptSuccess | TranscriptFailure;
 
-// ── Shared headers (✅ metadata와 동일하게 유지) ──
+// ── Shared headers (metadata와 동일 유지) ──
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -43,7 +43,6 @@ const BROWSER_HEADERS: Record<string, string> = {
   "Sec-Fetch-Site": "none",
   "Sec-Fetch-User": "?1",
   Referer: "https://www.youtube.com/",
-  // ✅ 핵심: consent 우회 쿠키 (metadata와 동일)
   Cookie: "CONSENT=YES+1; SOCS=CAI;",
 };
 
@@ -70,7 +69,10 @@ export async function GET(req: NextRequest) {
       const asr = await tryAsr(videoId);
       if (asr) return ok(asr, description, "asr");
 
-      return fail(process.env.ASR_ENDPOINT ? "PLAYER_RESPONSE_NOT_FOUND" : "ASR_NOT_CONFIGURED", description);
+      return fail(
+        process.env.ASR_ENDPOINT ? "PLAYER_RESPONSE_NOT_FOUND" : "ASR_NOT_CONFIGURED",
+        description,
+      );
     }
 
     // description
@@ -102,15 +104,15 @@ export async function GET(req: NextRequest) {
         redirect: "follow",
         cache: "no-store",
       });
+
       console.log("[caption] status", captionRes.status);
       console.log("[caption] url", track.baseUrl.slice(0, 180));
-      const xml = await captionRes.text();
-      console.log("[caption] bytes", xml.length);
-
 
       if (captionRes.ok) {
-        const xml = await captionRes.text();
-        const segments = parseCaptionXml(xml);
+        const xmlText = await captionRes.text(); // ✅ 한 번만 읽기
+        console.log("[caption] bytes", xmlText.length);
+
+        const segments = parseCaptionXml(xmlText);
         if (segments.length > 0) {
           return ok(segments.join("\n"), description, "caption_tracks");
         }
@@ -214,7 +216,7 @@ function isAgeRestricted(html: string) {
   );
 }
 
-// ✅ metadata에서 해결한 방식 그대로: brace 매칭
+// brace 매칭으로 ytInitialPlayerResponse JSON 추출
 function extractInitialPlayerResponse(html: string): Record<string, unknown> | null {
   const key = "ytInitialPlayerResponse";
   const idx = html.indexOf(key);
@@ -307,12 +309,11 @@ async function tryTimedtextApi(videoId: string): Promise<string | null> {
     });
 
     if (!res.ok) continue;
-    const xml = await res.text();
-    console.log("[timedtext]", lang, "status", res.status, "bytes", xml.length);
 
+    const xmlText = await res.text(); // ✅ 한 번만 읽기
+    console.log("[timedtext]", lang, "status", res.status, "bytes", xmlText.length);
 
-    const xml = await res.text();
-    const segments = parseCaptionXml(xml);
+    const segments = parseCaptionXml(xmlText);
     if (segments.length > 0) return segments.join("\n");
   }
 
@@ -326,8 +327,8 @@ async function tryTimedtextApi(videoId: string): Promise<string | null> {
     });
 
     if (res.ok) {
-      const xml = await res.text();
-      const segments = parseCaptionXml(xml);
+      const xmlText = await res.text();
+      const segments = parseCaptionXml(xmlText);
       if (segments.length > 0) return segments.join("\n");
     }
   }
