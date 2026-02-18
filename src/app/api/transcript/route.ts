@@ -1,46 +1,32 @@
 // src/app/api/transcript/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
-type ApiOk = {
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type ApiOut = {
   transcript: string | null;
   reason: string | null;
   description?: string | null;
   strategy?: string | null;
   error?: string | null;
+  debug?: any;
 };
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-function ytId(input: string | null): string | null {
+function extractVideoId(input: string | null): string | null {
   if (!input) return null;
-  // allow raw id or full url
-  const m1 = input.match(/^[a-zA-Z0-9_-]{11}$/);
-  if (m1) return input;
+  if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
 
-  const m2 = input.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+  const m1 = input.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+  if (m1) return m1[1];
+
+  const m2 = input.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
   if (m2) return m2[1];
-
-  const m3 = input.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
-  if (m3) return m3[1];
 
   return null;
 }
 
-function normalizeTimedtextUrl(raw: string): string {
-  // unescape JSON-escaped slashes and ampersands
-  const unescaped = raw.replaceAll("\\/", "/").replaceAll("\\u0026", "&");
-
-  // if relative path, make it absolute
-  if (unescaped.startsWith("/api/")) return `https://www.youtube.com${unescaped}`;
-
-  // some sources might return //www.youtube.com/...
-  if (unescaped.startsWith("//")) return `https:${unescaped}`;
-
-  return unescaped;
-}
-
-async function safeReadText(res: Response): Promise<string> {
+async function safeText(res: Response): Promise<string> {
   try {
     return await res.text();
   } catch {
@@ -48,210 +34,132 @@ async function safeReadText(res: Response): Promise<string> {
   }
 }
 
-function looksLikeJson(ct: string | null): boolean {
-  if (!ct) return false;
-  return ct.includes("application/json") || ct.includes("text/json");
+function findBalancedJsonAfter(html: string, marker: string): any | null {
+  const idx = html.indexOf(marker);
+  if (idx < 0) return null;
+
+  // find first "{"
+  const start = html.indexOf("{", idx);
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < html.length; i++) {
+    const ch = html[i];
+
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+        continue;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+
+    if (depth === 0) {
+      const jsonStr = html.slice(start, i + 1);
+      try {
+        return JSON.parse(jsonStr);
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  return null;
 }
 
-function isEmptyBodyText(t: string): boolean {
-  return !t || t.trim().length === 0;
+function extractDescriptionFromPlayerResponse(player: any): string | null {
+  // best-effort
+  const sd = player?.videoDetails?.shortDescription;
+  if (typeof sd === "string" && sd.trim()) return sd;
+  return null;
 }
 
-function jsonExtractDescription(html: string): string | null {
-  // best-effort: YouTube watch page often contains JSON with shortDescription
-  const m =
-    html.match(/"shortDescription":"([^"]*)"/) ||
-    html.match(/"description":{"simpleText":"([^"]*)"/);
-  if (!m) return null;
-  return m[1]
-    .replaceAll("\\n", "\n")
-    .replaceAll('\\"', '"')
-    .replaceAll("\\u0026", "&");
+function extractCaptionBaseUrl(player: any, langPref: string): { url: string | null; chosen?: any } {
+  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!Array.isArray(tracks) || tracks.length === 0) return { url: null };
+
+  // Prefer matching language, else first track
+  const byLang =
+    tracks.find((t: any) => t?.languageCode === langPref) ||
+    tracks.find((t: any) => (t?.languageCode || "").startsWith(langPref)) ||
+    tracks[0];
+
+  const baseUrl = typeof byLang?.baseUrl === "string" ? byLang.baseUrl : null;
+  return { url: baseUrl, chosen: byLang };
 }
 
-// --- Strategy 1: Official timedtext XML/VTT (often empty for asr) ---
-async function fetchTimedtextBasic(
-  videoId: string,
-  lang: string,
-  asr: boolean
-): Promise<{ transcript: string | null; reason: string | null; debug?: any }> {
-  const params = new URLSearchParams();
-  params.set("v", videoId);
-  params.set("lang", lang);
-  params.set("fmt", "vtt");
-  if (asr) params.set("kind", "asr");
+async function fetchTranscriptFromBaseUrl(baseUrl: string): Promise<{ transcript: string | null; debug: any }> {
+  // Force JSON3 output
+  const u = new URL(baseUrl);
+  u.searchParams.set("fmt", "json3");
 
-  const url = `https://www.youtube.com/api/timedtext?${params.toString()}`;
+  const url = u.toString();
   const res = await fetch(url, {
     headers: {
       "user-agent":
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
-    },
-    cache: "no-store",
-  });
-
-  const ct = res.headers.get("content-type");
-  const text = await safeReadText(res);
-
-  // YouTube sometimes returns 200 with text/html and empty body
-  if (!res.ok || isEmptyBodyText(text)) {
-    return {
-      transcript: null,
-      reason: "CAPTION_FETCH_FAILED",
-      debug: { url, status: res.status, ct, bytes: text.length },
-    };
-  }
-
-  // VTT parse: remove timestamps/WEBVTT metadata
-  const lines = text.split("\n");
-  const out: string[] = [];
-  for (const line of lines) {
-    const s = line.trim();
-    if (!s) continue;
-    if (s === "WEBVTT") continue;
-    if (/^\d+$/.test(s)) continue;
-    if (s.includes("-->")) continue;
-    if (s.startsWith("Kind:")) continue;
-    if (s.startsWith("Language:")) continue;
-    out.push(s);
-  }
-
-  const transcript = out.join(" ").replace(/\s+/g, " ").trim();
-  if (!transcript) {
-    return {
-      transcript: null,
-      reason: "NO_CAPTIONS",
-      debug: { url, status: res.status, ct, bytes: text.length },
-    };
-  }
-
-  return { transcript, reason: null, debug: { url, status: res.status, ct, bytes: text.length } };
-}
-
-// --- Strategy 2: youtubei_player(pb3) JSON timedtext (your working path) ---
-async function fetchTimedtextPb3Json(
-  videoId: string,
-  lang: string
-): Promise<{
-  transcript: string | null;
-  reason: string | null;
-  strategy?: string;
-  debug?: any;
-}> {
-  // 1) load watch HTML
-  const watchUrl = `https://www.youtube.com/watch?v=${videoId}&hl=ko`;
-  const watchRes = await fetch(watchUrl, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
-    },
-    cache: "no-store",
-  });
-
-  const watchHtml = await safeReadText(watchRes);
-
-  // 2) find any timedtext URL candidates inside the HTML
-  const candidates =
-    watchHtml.match(/https:\\\/\\\/www\.youtube\.com\\\/api\\\/timedtext\?v=[^"\\]+/g) ||
-    watchHtml.match(/https:\/\/www\.youtube\.com\/api\/timedtext\?v=[^"\\]+/g) ||
-    watchHtml.match(/\/api\/timedtext\?v=[^"\\]+/g) ||
-    [];
-
-  if (candidates.length === 0) {
-    return {
-      transcript: null,
-      reason: "NO_CAPTIONS",
-      strategy: "youtubei_player",
-      debug: { watchUrl, note: "no timedtext candidate found" },
-    };
-  }
-
-  // pick first, normalize
-  const base = normalizeTimedtextUrl(candidates[0]);
-
-  // 3) build pb3 request
-  // NOTE: Your success log showed these often present: caps=asr, hl=ko, ip=0.0.0.0, plus other tracking params.
-  // We'll keep what we have, and enforce JSON output with fmt=json3 where possible.
-  const u = new URL(base);
-  u.searchParams.set("v", videoId);
-
-  // ensure "asr" captions route is allowed
-  // many pages use "caps=asr"
-  if (!u.searchParams.has("caps")) u.searchParams.set("caps", "asr");
-
-  // language
-  u.searchParams.set("hl", "ko");
-  // request json
-  u.searchParams.set("fmt", "json3");
-  // target caption language (for asr, this is the actual language)
-  u.searchParams.set("lang", lang);
-
-  // the ip=0.0.0.0 trick often makes YouTube return the pb3 JSON consistently
-  // (You already observed this.)
-  u.searchParams.set("ip", "0.0.0.0");
-
-  const pb3Url = u.toString();
-
-  const res = await fetch(pb3Url, {
-    headers: {
-      "user-agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
       accept: "application/json,text/plain,*/*",
+      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
     },
     cache: "no-store",
   });
 
   const ct = res.headers.get("content-type");
+  const body = await safeText(res);
 
-  // IMPORTANT: don’t call res.json() blindly
-  const bodyText = await safeReadText(res);
-
-  if (!res.ok || isEmptyBodyText(bodyText)) {
+  // If empty or not JSON, stop here with debug
+  const head = body.slice(0, 200);
+  if (!res.ok || !body.trim()) {
     return {
       transcript: null,
-      reason: "CAPTION_FETCH_FAILED",
-      strategy: "youtubei_player",
-      debug: { pb3Url, status: res.status, ct, bytes: bodyText.length, head: bodyText.slice(0, 200) },
+      debug: { step: "timedtext_fetch", url, status: res.status, ct, bytes: body.length, head },
     };
   }
 
-  // Sometimes YouTube lies with content-type; check first non-space char
-  const first = bodyText.trimStart()[0];
-  const maybeJson = looksLikeJson(ct) || first === "{" || first === "[";
-
-  if (!maybeJson) {
+  const first = body.trimStart()[0];
+  if (!(first === "{" || first === "[")) {
     return {
       transcript: null,
-      reason: "CAPTION_FETCH_FAILED",
-      strategy: "youtubei_player",
-      debug: { pb3Url, status: res.status, ct, bytes: bodyText.length, head: bodyText.slice(0, 200) },
+      debug: { step: "timedtext_not_json", url, status: res.status, ct, bytes: body.length, head },
     };
   }
 
   let json: any;
   try {
-    json = JSON.parse(bodyText);
+    json = JSON.parse(body);
   } catch (e: any) {
     return {
       transcript: null,
-      reason: "CAPTION_FETCH_FAILED",
-      strategy: "youtubei_player",
       debug: {
-        pb3Url,
+        step: "timedtext_json_parse_failed",
+        url,
         status: res.status,
         ct,
-        bytes: bodyText.length,
+        bytes: body.length,
+        head,
         parseError: String(e?.message || e),
-        head: bodyText.slice(0, 200),
       },
     };
   }
 
-  // json3 format can be:
-  // { events: [ {segs:[{utf8:"..."}]} ] }
   const events = Array.isArray(json?.events) ? json.events : [];
   const parts: string[] = [];
   for (const ev of events) {
@@ -262,95 +170,94 @@ async function fetchTimedtextPb3Json(
     }
   }
 
-  const transcript = parts.join("").replace(/\s+/g, " ").trim();
-  if (!transcript) {
-    return {
-      transcript: null,
-      reason: "NO_CAPTIONS",
-      strategy: "youtubei_player",
-      debug: { pb3Url, status: res.status, ct, bytes: bodyText.length },
-    };
-  }
-
+  const transcript = parts.join("").replace(/\s+/g, " ").trim() || null;
   return {
     transcript,
-    reason: null,
-    strategy: "youtubei_player",
-    debug: { pb3Url, status: res.status, ct, bytes: bodyText.length },
+    debug: { step: "timedtext_ok", url, status: res.status, ct, bytes: body.length },
   };
 }
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
 
-  const vRaw = searchParams.get("v");
-  const tlang = searchParams.get("tlang"); // optional target language for future use
-  const videoId = ytId(vRaw);
+  const vid = extractVideoId(searchParams.get("v"));
+  const debugOn = searchParams.get("debug") === "1";
+  const lang = searchParams.get("lang") || "ko";
 
-  if (!videoId) {
-    const out: ApiOk = {
-      transcript: null,
-      reason: "BAD_REQUEST",
-      error: "Missing or invalid video id",
-      description: null,
-      strategy: null,
-    };
+  if (!vid) {
+    const out: ApiOut = { transcript: null, reason: "BAD_REQUEST", error: "Missing/invalid v" };
     return NextResponse.json(out, { status: 400 });
   }
 
-  // 0) Grab description best-effort (for NO_CAPTIONS fallback UI)
-  let description: string | null = null;
-  try {
-    const watchUrl = `https://www.youtube.com/watch?v=${videoId}&hl=ko`;
-    const r = await fetch(watchUrl, {
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "accept-language": "en-US,en;q=0.9,ko;q=0.8",
-      },
-      cache: "no-store",
-    });
-    const html = await safeReadText(r);
-    description = jsonExtractDescription(html);
-  } catch {
-    // ignore
-  }
+  // 1) fetch watch HTML
+  const watchUrl = `https://www.youtube.com/watch?v=${vid}&hl=${encodeURIComponent(lang)}`;
+  const watchRes = await fetch(watchUrl, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      "accept-language": "en-US,en;q=0.9,ko;q=0.8",
+    },
+    cache: "no-store",
+  });
 
-  // 1) Prefer pb3 json (this is what worked for your auto-captions)
-  const pb3 = await fetchTimedtextPb3Json(videoId, "ko");
-  if (pb3.transcript) {
-    const out: ApiOk = {
-      transcript: pb3.transcript,
-      reason: null,
-      description,
-      strategy: pb3.strategy ?? "youtubei_player",
+  const html = await safeText(watchRes);
+
+  // 2) extract ytInitialPlayerResponse safely (brace matching)
+  const player =
+    findBalancedJsonAfter(html, "var ytInitialPlayerResponse =") ||
+    findBalancedJsonAfter(html, "ytInitialPlayerResponse =") ||
+    null;
+
+  if (!player) {
+    const out: ApiOut = {
+      transcript: null,
+      reason: "CAPTION_FETCH_FAILED",
+      strategy: "ytInitialPlayerResponse",
+      error: "Could not parse ytInitialPlayerResponse from watch HTML",
+      debug: debugOn
+        ? { step: "watch_fetch", watchUrl, status: watchRes.status, bytes: html.length, head: html.slice(0, 200) }
+        : undefined,
     };
     return NextResponse.json(out);
   }
 
-  // 2) fallback: try basic (manual captions sometimes work)
-  const basic = await fetchTimedtextBasic(videoId, "ko", true);
-  if (basic.transcript) {
-    const out: ApiOk = {
-      transcript: basic.transcript,
-      reason: null,
+  const description = extractDescriptionFromPlayerResponse(player);
+
+  // 3) caption baseUrl from captionTracks
+  const { url: baseUrl, chosen } = extractCaptionBaseUrl(player, lang);
+
+  if (!baseUrl) {
+    const out: ApiOut = {
+      transcript: null,
+      reason: "NO_CAPTIONS",
       description,
-      strategy: "timedtext_vtt",
+      strategy: "captionTracks_missing",
+      debug: debugOn ? { step: "no_tracks", chosenTrack: chosen ?? null } : undefined,
     };
     return NextResponse.json(out);
   }
 
-  // 3) final: no captions
-  const out: ApiOk = {
-    transcript: null,
-    reason: pb3.reason || basic.reason || "NO_CAPTIONS",
+  // 4) fetch transcript json3
+  const t = await fetchTranscriptFromBaseUrl(baseUrl);
+
+  if (!t.transcript) {
+    const out: ApiOut = {
+      transcript: null,
+      reason: "CAPTION_FETCH_FAILED",
+      description,
+      strategy: "timedtext_json3",
+      error: null,
+      debug: debugOn ? { chosenTrack: chosen, ...t.debug } : undefined,
+    };
+    return NextResponse.json(out);
+  }
+
+  const out: ApiOut = {
+    transcript: t.transcript,
+    reason: null,
     description,
-    strategy: pb3.strategy ?? null,
-    error:
-      (pb3 as any)?.debug?.parseError ||
-      (pb3 as any)?.debug?.note ||
-      (basic as any)?.debug?.note ||
-      null,
+    strategy: "ytInitialPlayerResponse.captionTracks",
+    debug: debugOn ? { chosenTrack: chosen, ...t.debug } : undefined,
   };
 
   return NextResponse.json(out);
