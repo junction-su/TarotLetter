@@ -29,7 +29,7 @@ interface TranscriptFailure {
 
 type TranscriptResult = TranscriptSuccess | TranscriptFailure;
 
-// ── Shared headers (metadata와 동일 유지) ──
+// ── Shared headers ──
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -43,6 +43,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   "Sec-Fetch-Site": "none",
   "Sec-Fetch-User": "?1",
   Referer: "https://www.youtube.com/",
+  // ✅ 핵심: consent 우회 쿠키 (metadata에서 성공했던 값과 동일하게 유지)
   Cookie: "CONSENT=YES+1; SOCS=CAI;",
 };
 
@@ -100,19 +101,22 @@ export async function GET(req: NextRequest) {
       const track = manual ?? tracks[0];
 
       const captionRes = await fetch(track.baseUrl, {
-        headers: { "User-Agent": UA },
+        headers: {
+          "User-Agent": UA,
+          "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+          Cookie: BROWSER_HEADERS["Cookie"], // ✅ 중요
+          Accept: "*/*",
+        },
         redirect: "follow",
         cache: "no-store",
       });
 
+      const captionBody = await captionRes.text(); // ✅ 한 번만 읽기
       console.log("[caption] status", captionRes.status);
-      console.log("[caption] url", track.baseUrl.slice(0, 180));
+      console.log("[caption] bytes", captionBody.length);
 
-      if (captionRes.ok) {
-        const xmlText = await captionRes.text(); // ✅ 한 번만 읽기
-        console.log("[caption] bytes", xmlText.length);
-
-        const segments = parseCaptionXml(xmlText);
+      if (captionRes.ok && captionBody.length > 0) {
+        const segments = parseCaptionXml(captionBody);
         if (segments.length > 0) {
           return ok(segments.join("\n"), description, "caption_tracks");
         }
@@ -127,21 +131,16 @@ export async function GET(req: NextRequest) {
     const asr = await tryAsr(videoId);
     if (asr) return ok(asr, description, "asr");
 
-    // exhausted
-    const reason: TranscriptFailReason =
-      !tracks || tracks.length === 0
-        ? process.env.ASR_ENDPOINT
-          ? "NO_CAPTIONS"
-          : "ASR_NOT_CONFIGURED"
-        : "CAPTION_FETCH_FAILED";
-
-    return fail(reason, description);
+    // exhausted → 자막 자체가 없으면 NO_CAPTIONS로 정확히 반환
+    const hasTracks = !!(tracks && tracks.length > 0);
+    const reason: TranscriptFailReason = hasTracks ? "CAPTION_FETCH_FAILED" : "NO_CAPTIONS";
+    return fail(process.env.ASR_ENDPOINT ? reason : hasTracks ? "CAPTION_FETCH_FAILED" : "ASR_NOT_CONFIGURED", description);
   } catch {
     return fail("CAPTION_FETCH_FAILED", description);
   }
 }
 
-// ── Helpers: response ──
+// ── Response helpers ──
 function ok(transcript: string, description: string | null, strategy: TranscriptStrategy) {
   return NextResponse.json<TranscriptResult>({
     transcript,
@@ -160,7 +159,7 @@ function fail(reason: TranscriptFailReason, description: string | null) {
   });
 }
 
-// ── Helpers: watch page fetch + parse ──
+// ── Watch page fetch + parse ──
 interface WatchPageResult {
   playerResponse: Record<string, unknown> | null;
   blocked: TranscriptFailReason | null;
@@ -216,7 +215,7 @@ function isAgeRestricted(html: string) {
   );
 }
 
-// brace 매칭으로 ytInitialPlayerResponse JSON 추출
+// ✅ 안정적인 brace 매칭 파싱
 function extractInitialPlayerResponse(html: string): Record<string, unknown> | null {
   const key = "ytInitialPlayerResponse";
   const idx = html.indexOf(key);
@@ -268,7 +267,7 @@ function sliceBalancedBraces(s: string, start: number): string | null {
   return null;
 }
 
-// ── Helpers: caption XML parsing ──
+// ── Caption parsing ──
 interface CaptionTrack {
   baseUrl: string;
   kind?: string;
@@ -296,59 +295,113 @@ function decodeXmlEntities(s: string): string {
     .replace(/&#39;/g, "'");
 }
 
-// ── Helpers: timedtext fallback ──
+// ── Timedtext fallback (srv3 + vtt) ──
+function parseVttToText(vtt: string): string[] {
+  return vtt
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && l !== "WEBVTT" && !l.includes("-->") && !/^\d+$/.test(l));
+}
+
 async function tryTimedtextApi(videoId: string): Promise<string | null> {
   const langs = ["ko", "en", "ja", "es"];
 
   for (const lang of langs) {
-    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": UA },
-      redirect: "follow",
-      cache: "no-store",
-    });
+    // srv3
+    {
+      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=srv3`;
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": UA,
+          "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+          Cookie: BROWSER_HEADERS["Cookie"],
+          Accept: "*/*",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
 
-    if (!res.ok) continue;
+      const body = await res.text(); // ✅ 한 번만 읽기
+      console.log("[timedtext srv3]", lang, "status", res.status, "bytes", body.length);
 
-    const xmlText = await res.text(); // ✅ 한 번만 읽기
-    console.log("[timedtext]", lang, "status", res.status, "bytes", xmlText.length);
+      if (res.ok && body.length > 0) {
+        const segments = parseCaptionXml(body);
+        if (segments.length > 0) return segments.join("\n");
+      }
+    }
 
-    const segments = parseCaptionXml(xmlText);
-    if (segments.length > 0) return segments.join("\n");
+    // vtt fallback
+    {
+      const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&fmt=vtt`;
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": UA,
+          "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+          Cookie: BROWSER_HEADERS["Cookie"],
+          Accept: "*/*",
+        },
+        redirect: "follow",
+        cache: "no-store",
+      });
+
+      const body = await res.text(); // ✅ 한 번만 읽기
+      console.log("[timedtext vtt]", lang, "status", res.status, "bytes", body.length);
+
+      if (res.ok && body.length > 0) {
+        const lines = parseVttToText(body);
+        if (lines.length > 0) return lines.join("\n");
+      }
+    }
   }
 
-  // auto (asr)
-  {
-    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=srv3`;
+  // asr (auto captions)
+  for (const fmt of ["srv3", "vtt"] as const) {
+    const url = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=${fmt}`;
     const res = await fetch(url, {
-      headers: { "User-Agent": UA },
+      headers: {
+        "User-Agent": UA,
+        "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+        Cookie: BROWSER_HEADERS["Cookie"],
+        Accept: "*/*",
+      },
       redirect: "follow",
       cache: "no-store",
     });
 
-    if (res.ok) {
-      const xmlText = await res.text();
-      const segments = parseCaptionXml(xmlText);
-      if (segments.length > 0) return segments.join("\n");
+    const body = await res.text(); // ✅ 한 번만 읽기
+    console.log("[timedtext asr]", fmt, "status", res.status, "bytes", body.length);
+
+    if (res.ok && body.length > 0) {
+      if (fmt === "srv3") {
+        const segments = parseCaptionXml(body);
+        if (segments.length > 0) return segments.join("\n");
+      } else {
+        const lines = parseVttToText(body);
+        if (lines.length > 0) return lines.join("\n");
+      }
     }
   }
 
   return null;
 }
 
-// ── Helpers: external ASR ──
+// ── External ASR fallback ──
 async function tryAsr(videoId: string): Promise<string | null> {
   const endpoint = process.env.ASR_ENDPOINT;
   if (!endpoint) return null;
 
-  const res = await fetch(`${endpoint}/transcribe`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ videoId }),
-  });
+  try {
+    const res = await fetch(`${endpoint}/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ videoId }),
+    });
 
-  if (!res.ok) return null;
+    if (!res.ok) return null;
 
-  const data: { transcript?: string } = await res.json();
-  return data.transcript ?? null;
+    const data: { transcript?: string } = await res.json();
+    return data.transcript ?? null;
+  } catch {
+    return null;
+  }
 }
