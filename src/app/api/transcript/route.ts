@@ -1,65 +1,103 @@
-import { NextResponse } from "next/server";
+async function fetchCaptionFromTracks(
+  tracks: Array<{ baseUrl: string; kind?: string }>,
+  tlang?: string,
+): Promise<string | null> {
+  const manual = tracks.find((t) => t.kind !== "asr");
+  const track = manual ?? tracks[0];
+  if (!track?.baseUrl) return null;
 
-function cleanupTranscript(input: string) {
-  let s = input || "";
+  // ✅ fmt는 json3로 먼저 시도 (제일 안정적)
+  const urlJson3 = withQuery(track.baseUrl, {
+    fmt: "json3",
+    ...(tlang ? { tlang } : {}),
+  });
 
-  // normalize newlines
-  s = s.replace(/\r\n/g, "\n");
+  let res = await fetch(urlJson3, {
+    headers: CAPTION_HEADERS,
+    redirect: "follow",
+    cache: "no-store",
+  });
 
-  // remove timestamps like 00:00, 01:05, 12:34
-  s = s.replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, " ");
+  const ct1 = res.headers.get("content-type") || "";
+  const body1 = await res.text();
 
-  // remove repeated spaces/newlines
-  s = s.replace(/[ \t]+/g, " ");
-  s = s.replace(/\n{3,}/g, "\n\n");
+  console.log("[caption] status", res.status);
+  console.log("[caption] content-type", ct1);
+  console.log("[caption] url(head)", urlJson3.slice(0, 140));
+  console.log("[caption] bytes", body1.length);
+  console.log("[caption] head", body1.slice(0, 200));
 
-  // remove very long “description-like” blocks (optional heuristic)
-  // If you don't want this, delete this block.
-  // Many “NO_CAPTIONS” cases returned description instead of transcript.
-  const lines = s.split("\n");
-  const trimmedLines = lines.filter((l) => l.trim().length > 0);
-  // If it looks like a description with lots of links/emoji/promo, keep only the first N lines
-  const promoHits = (s.match(/https?:\/\/|📞|📲|구독|좋아요|tumblbug|예약/g) || []).length;
-  if (promoHits >= 3 && trimmedLines.length > 30) {
-    s = trimmedLines.slice(0, 30).join("\n");
+  if (res.ok && body1.length > 20) {
+    const text = parseCaptionAny(body1);
+    if (text) return text;
   }
 
-  // final single-line transcript (you can keep paragraphs if you want)
-  const oneLine = s.replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
+  // ✅ json3가 막혔거나 비면 srv3(XML)도 한 번 더
+  const urlSrv3 = withQuery(track.baseUrl, {
+    fmt: "srv3",
+    ...(tlang ? { tlang } : {}),
+  });
 
-  return { oneLine, raw: s.trim() };
+  res = await fetch(urlSrv3, {
+    headers: CAPTION_HEADERS,
+    redirect: "follow",
+    cache: "no-store",
+  });
+
+  const ct2 = res.headers.get("content-type") || "";
+  const body2 = await res.text();
+
+  console.log("[caption2] status", res.status);
+  console.log("[caption2] content-type", ct2);
+  console.log("[caption2] url(head)", urlSrv3.slice(0, 140));
+  console.log("[caption2] bytes", body2.length);
+  console.log("[caption2] head", body2.slice(0, 200));
+
+  if (!res.ok || body2.length < 20) return null;
+
+  const text2 = parseCaptionAny(body2);
+  return text2;
 }
 
-export async function POST(req: Request) {
+/** ✅ XML(<text>)든 JSON3든 둘 다 처리 */
+function parseCaptionAny(payload: string): string | null {
+  const s = payload.trim();
+
+  // XML
+  if (s.includes("<text") && s.includes("</text>")) {
+    const segs = parseCaptionXml(s);
+    return segs.length ? segs.join("\n") : null;
+  }
+
+  // JSON3
+  if (s.startsWith("{")) {
+    const segs = parseCaptionJson3(s);
+    return segs.length ? segs.join("\n") : null;
+  }
+
+  // HTML(차단/동의/리디렉트 등)
+  if (s.startsWith("<!DOCTYPE") || s.startsWith("<html")) return null;
+
+  return null;
+}
+
+function parseCaptionJson3(jsonText: string): string[] {
   try {
-    const body = await req.json();
-    const transcript = typeof body?.transcript === "string" ? body.transcript : "";
-    const meta = body?.meta ?? null;
+    const data = JSON.parse(jsonText) as any;
+    const events = Array.isArray(data?.events) ? data.events : [];
+    const out: string[] = [];
 
-    if (!transcript.trim()) {
-      return NextResponse.json(
-        { transcript: null, reason: "EMPTY_INPUT", meta },
-        { status: 400 }
-      );
+    for (const ev of events) {
+      const segs = Array.isArray(ev?.segs) ? ev.segs : [];
+      const line = segs
+        .map((x: any) => (typeof x?.utf8 === "string" ? x.utf8 : ""))
+        .join("")
+        .replace(/\n/g, " ")
+        .trim();
+      if (line) out.push(line);
     }
-
-    const cleaned = cleanupTranscript(transcript);
-
-    return NextResponse.json({
-      transcript: cleaned.oneLine,
-      transcript_raw: cleaned.raw,
-      reason: null,
-      meta,
-    });
-  } catch (e: any) {
-    return NextResponse.json(
-      { transcript: null, reason: "BAD_REQUEST", error: String(e?.message || e) },
-      { status: 400 }
-    );
+    return out;
+  } catch {
+    return [];
   }
-}
-
-// optional: GET for quick health check
-export async function GET() {
-  return NextResponse.json({ ok: true, hint: "POST { transcript } to clean" });
 }
